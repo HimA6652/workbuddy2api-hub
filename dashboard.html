@@ -206,6 +206,23 @@ th.sortable:focus-visible .sort-arrow.idle{opacity:1}
 .bar-fill.think{background:var(--think)}
 .table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;width:100%;border-radius:8px}
 .table-wrap table{min-width:720px}
+/* 单元格里「长文本省略号」的统一 span：截断样式收在这里，宽度上限由行内
+   style 按列给（不同列不同），媒体查询只调上限与折行行为。 */
+.note-clip{display:inline-block;vertical-align:bottom;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;max-width:100%}
+/* 中屏（641–960px）：桌面表格布局还在，但横向空间有限。固定 px 的说明上限
+   在这个区间最挤——一条 429 原文能把「账号」压到贴着「时间」。这里把说明列
+   收到 300px（行内 max-width 优先级更高，须 !important 才盖得住）；表格下限
+   720px 不动，摆不下仍横向滚动，列宽不会被压扁。账号列的 160px 上限不动。 */
+@media (min-width:641px) and (max-width:960px){
+  td[data-label="说明"] .note-clip{max-width:300px!important}
+}
+/* 手机卡片模式（≤640px）：每格独占一行，折行显示全文，不再省略号截断
+   （完整内容本来也在 title 里，但触屏没有 hover，截断了就看不全）。 */
+@media (max-width:640px){
+  table.data-cards .note-clip{white-space:normal;overflow:visible;text-overflow:clip;
+    overflow-wrap:anywhere;word-break:break-word}
+}
 #recent table th, #recent table td{text-align:center}
 #recent table th:first-child, #recent table td:first-child{text-align:center}
 #recent table td.mono{font-variant-numeric:tabular-nums}
@@ -8432,9 +8449,10 @@ function activityHistoryRow(row){
     +   (row && row.ok ? '<span class="badge ok">成功</span>' : '<span class="badge bad">失败</span>')
     + '</td>'
     // 上游原文可能很长：在 span 上做行内截断（td 自身不吃 max-width），完整
-    // 内容留在 title 里，模态框不会被撑宽。
+    // 内容留在 title 里，模态框不会被撑宽。.note-clip 与账号页活动表共用分档
+    // 上限（中屏 300px），手机上由 640px 断点改折行。
     + '<td data-label="说明" style="text-align:left">'
-    +   '<span style="display:inline-block;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom"'
+    +   '<span class="note-clip" style="max-width:420px"'
     +   ' title="' + esc(message) + '">' + esc(message || '—') + '</span></td>'
     + '</tr>';
 }
@@ -8945,7 +8963,7 @@ function renderActivityBoard(data){
                                : '<span class="badge bad">失败</span>';
   box.innerHTML = '<table class="data-cards"><thead><tr>'
     + '<th style="text-align:left;width:132px">时间</th>'
-    + '<th style="text-align:left">账号</th>'
+    + '<th style="text-align:left;width:11%">账号</th>'
     + '<th style="text-align:center;width:76px">区域</th>'
     + '<th style="text-align:left;width:132px">任务</th>'
     + '<th style="text-align:center;width:76px">来源</th>'
@@ -8955,7 +8973,8 @@ function renderActivityBoard(data){
     + rows.map(r => '<tr>'
         + '<td class="mono" data-label="时间">' + esc(activityTime(r.ts)) + '</td>'
         + '<td data-label="账号" title="' + esc(r.uid || '') + '">'
-          + '<span data-no-i18n>' + esc(activityWho(r)) + '</span></td>'
+          + '<span class="note-clip" style="max-width:160px" title="'
+          + esc(activityWho(r)) + '" data-no-i18n>' + esc(activityWho(r)) + '</span></td>'
         + '<td style="text-align:center" data-label="区域">'
           + esc(ACTIVITY_REALM_LABEL[r.realm] || '—') + '</td>'
         + '<td data-label="任务">' + esc(ACTIVITY_TASK_LABEL[r.task] || r.task || '—') + '</td>'
@@ -8964,9 +8983,11 @@ function renderActivityBoard(data){
         + '<td style="text-align:center" data-label="结果">' + resultBadge(r.ok) + '</td>'
         // 上游原文可能很长：在 span 上做行内截断（td 自身不吃 max-width，撑宽的是
         // 整张表），完整内容留在 title 里，表格不会被一条 429 原文拉出横向滚动。
+        // 上限分档给（.note-clip）：大屏 520px，中屏 641–960px 桌面布局还在但
+        // 宽度有限，收到 300px，免得账号贴着时间；手机卡片模式下改折行显示全文。
         + '<td data-label="说明" style="text-align:left">'
         +   (r.message
-              ? '<span style="display:inline-block;max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom" title="' + esc(r.message) + '">' + esc(r.message) + '</span>'
+              ? '<span class="note-clip" style="max-width:520px" title="' + esc(r.message) + '">' + esc(r.message) + '</span>'
               : '<span style="color:var(--dim)">—</span>')
         + '</td>'
         + '</tr>').join('')

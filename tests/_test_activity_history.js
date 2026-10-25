@@ -246,7 +246,7 @@ const check = (label, cond, extra) => {
         historyOut().includes('title="&lt;img src=x onerror=alert(1)&gt; 上游 500"'),
         historyOut().slice(0, 300));
   check('the message cell truncates instead of widening the modal',
-        historyOut().includes('text-overflow:ellipsis'));
+        historyOut().includes('note-clip'));
   check('both results render, each on its own row',
         historyOut().includes('badge bad') && historyOut().includes('badge ok'));
 

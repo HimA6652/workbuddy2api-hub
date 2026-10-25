@@ -238,7 +238,7 @@ function check(label, ok, detail){
   const h = listHtml();
   check('时间按落盘的墙上时间显示', h.includes('10-09 21:03'), h.slice(0, 160));
   check('昵称进账号列', h.includes('老王'));
-  check('昵称标记为不翻译', h.includes('<span data-no-i18n>老王</span>'));
+  check('昵称标记为不翻译', h.includes('data-no-i18n') && h.includes('>老王</span>'));
   check('没有昵称时回落到 uid 前 8 位', h.includes('uid-abcd'), h.slice(0, 400));
   check('区域列', h.includes('国内版') && h.includes('国际版'));
   check('任务列', h.includes('国内版签到') && h.includes('国际版每日活跃'));
