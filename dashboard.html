@@ -223,6 +223,15 @@ th.sortable:focus-visible .sort-arrow.idle{opacity:1}
   table.data-cards .note-clip{white-space:normal;overflow:visible;text-overflow:clip;
     overflow-wrap:anywhere;word-break:break-word}
 }
+/* 活动表的短标签列（时间/区域/任务/来源/结果）不许逐字折行：表格自动布局
+   里说明列一挤，这些列会被压到一字宽——「国际版每日活跃」变成一字一行的
+   竖条，行高撑到七八行。nowrap 给布局一个真实下限（列至少要放得下标签），
+   宽度不够时整表横向滚动，而不是把标签竖起来；说明列仍是弹性吸收方。 */
+table.activity-table td[data-label="时间"],
+table.activity-table td[data-label="区域"],
+table.activity-table td[data-label="任务"],
+table.activity-table td[data-label="来源"],
+table.activity-table td[data-label="结果"]{white-space:nowrap}
 #recent table th, #recent table td{text-align:center}
 #recent table th:first-child, #recent table td:first-child{text-align:center}
 #recent table td.mono{font-variant-numeric:tabular-nums}
@@ -6003,7 +6012,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
         <button class="sec" onclick="loadActivityHistory()">刷新</button>
       </div>
       <div class="table-wrap">
-        <table class="data-cards"><thead><tr>
+        <table class="data-cards activity-table"><thead><tr>
           <th>时间</th><th>账号</th><th>任务</th><th>结果</th><th>说明</th>
         </tr></thead><tbody id="activityHistoryRows"></tbody></table>
       </div>
@@ -8961,7 +8970,7 @@ function renderActivityBoard(data){
   }
   const resultBadge = ok => ok ? '<span class="badge ok">成功</span>'
                                : '<span class="badge bad">失败</span>';
-  box.innerHTML = '<table class="data-cards"><thead><tr>'
+  box.innerHTML = '<table class="data-cards activity-table"><thead><tr>'
     + '<th style="text-align:left;width:132px">时间</th>'
     + '<th style="text-align:left;width:11%">账号</th>'
     + '<th style="text-align:center;width:76px">区域</th>'
