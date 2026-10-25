@@ -165,4 +165,21 @@ ok('程序化改 value 也能同步显示', () => {
   assert.ok(script.includes('HTMLSelectElement.prototype'), 'missing value setter hook');
 });
 
+ok('全宽判定只认显式 width:100%，不信 computed display', () => {
+  // 回归背景：flex 子项与隐藏页签里的 select，computed display 都会被浏览器
+  // 规范化成 block，曾被当成「该占满一行」的证据，把工具栏里并排的下拉全部
+  // 顶成竖排（账号页筛选条、任务页、设置页、历史弹窗、积分包排序都中招）。
+  // 真正想全宽的控件都有显式 style.width:100%，就只认它，别再猜布局。
+  const idx = script.indexOf('function enhance(sel)');
+  assert.ok(idx > 0, 'missing enhance()');
+  const body = script.slice(idx, script.indexOf('function buildPanel', idx));
+  assert.ok(!/cs\.display\s*===\s*'block'/.test(body),
+    'enhance must not read computed display (flex children normalize to block)');
+  assert.ok(body.includes("sel.style.width === '100%'"),
+    'enhance must check the explicit inline width');
+  // 原生控件的 max-width 上限要搬进 wrapper，否则增强会吞掉宽度约束
+  assert.ok(body.includes('wrap.style.maxWidth'),
+    'enhance must carry the native max-width onto the wrapper');
+});
+
 console.log('\n  ' + passed + ' assertions passed (custom select)');

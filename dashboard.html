@@ -5989,7 +5989,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
           <option value="7d" selected>近 7 天</option>
           <option value="30d">近 30 天</option>
         </select>
-        <select id="actUid" onchange="setActivityFilter('uid', this.value)" title="账号"></select>
+        <select id="actUid" onchange="setActivityFilter('uid', this.value)" title="账号" style="max-width:180px"></select>
         <select id="actTask" onchange="setActivityFilter('task', this.value)" title="任务">
           <option value="">全部任务</option>
           <option value="checkin">国内签到</option>
@@ -18111,10 +18111,18 @@ if (typeof SORT_DENY_TABLES !== 'undefined' && SORT_DENY_TABLES && SORT_DENY_TAB
 
     var wrap = document.createElement('span');
     wrap.className = 'cs-wrap';
-    var cs = window.getComputedStyle(sel);
-    if (cs.display === 'block' || cs.width === '100%' || sel.style.width === '100%'){
+    /* 只认控件自己的显式 width:100%：computed display 不可信——flex 容器的
+       子项、以及还藏在 display:none 页签里的 select，计算值都会被规范化成
+       block，曾经因此把工具栏里并排的下拉全部误判成「独占一行」顶成竖排
+       （账号页筛选条、任务页、设置页、历史弹窗、积分包排序都中招）。 */
+    if (sel.style.width === '100%'){
       wrap.classList.add('cs-block');
     }
+    /* 原生控件上的 max-width（.slot-select 的 140px 等）要跟着搬：增强后
+       可见的是触发器而不是 select，不搬的话「全部账号」里一条长昵称就能把
+       工具栏撑歪——上限本来就是给控件定的，不该因为增强而消失。 */
+    var mw = window.getComputedStyle(sel).maxWidth;
+    if (mw && mw !== 'none' && mw !== '0px') wrap.style.maxWidth = mw;
     if (sel.id) wrap.setAttribute('data-for', sel.id);
     sel.parentNode.insertBefore(wrap, sel);
     wrap.appendChild(sel);
