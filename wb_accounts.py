@@ -1133,9 +1133,9 @@ class Account(object):
         # AccountPool.apply_daily_credit_limit(); 0 disables the guard.
         self.daily_credit_limit = 0
         self.daily_credits_today = None
-        # The realm's free model ids, pushed by the same apply call. Empty
-        # until then, and an unknown model counts as paid, so the guard
-        # fails closed instead of leaking spend through unseen names.
+        # The realm's free model ids, pushed by the daily-credit and reserve
+        # apply calls. Empty until then, and an unknown model counts as paid,
+        # so both guards fail closed instead of leaking spend through unseen ids.
         self.free_models = frozenset()
         # Per-model daily guard: once ONE model burned the configured tokens
         # today the account stops being handed out for that model only -
@@ -1301,6 +1301,7 @@ class Account(object):
             # 账号档位（#505）：面板在「会员类型」旁显示包名与读取时刻。
             "tier": self.tier,
             "reserveCredits": int(self.reserve_credits or 0),
+            # Account-level state, even while an explicitly free model serves.
             "reserveBlocked": self.reserve_blocked(),
             "dailyTokenLimit": int(self.daily_token_limit or 0),
             "dailyTokensToday": (int(self.daily_tokens_today)
@@ -1430,14 +1431,18 @@ class Account(object):
         if self.path and os.path.exists(self.path):
             os.remove(self.path)
 
-    def reserve_blocked(self):
-        """True when the low-credit guard should keep this account idle.
+    def reserve_blocked(self, model=None):
+        """True when the low-credit guard should keep this account off `model`.
 
         Only a *known* balance can block: an account whose credits were never
         fetched stays usable, otherwise a fresh install would look empty.
+        A positive reserve exempts models the realm catalogue marks free;
+        paid, unknown, and model-less calls retain the account-level guard.
         """
         reserve = int(self.reserve_credits or 0)
         if reserve <= 0:
+            return False
+        if model and self.model_is_free(model):
             return False
         credits = self.credits
         if not isinstance(credits, dict):
@@ -1766,7 +1771,7 @@ class Account(object):
             elif label.startswith("模型") and self.unscoped_streak > 1:
                 streak = "（连续第 %d 次）" % self.unscoped_streak
             return "%s 剩余 %s%s" % (label, _human_left(until - now), streak)
-        if self.reserve_blocked():
+        if self.reserve_blocked(model):
             return "余额低于保留线"
         if self.daily_limit_blocked():
             return "今日 Token 额度用尽"
@@ -1806,9 +1811,9 @@ class Account(object):
             return False
         if self.throttle_wait(model=model) > 0:
             return False
-        # Parked below the reserve: serving a request here is what would push
-        # the balance to zero and trigger the upstream reminder SMS.
-        if self.reserve_blocked():
+        # A positive reserve stops paid requests below the floor; catalogue-
+        # free models cannot spend the balance this guard protects.
+        if self.reserve_blocked(model):
             return False
         # Today's token budget is spent: keep the seat for tomorrow instead
         # of letting the upstream answer 429 for the rest of the day.
@@ -4681,7 +4686,7 @@ class AccountPool(object):
                 else:
                     account.proxy = account.proxy_legacy
 
-    def apply_reserve_credits(self, values=None):
+    def apply_reserve_credits(self, values=None, free_models=None):
         """Re-resolve the low-credit guard for every account.
 
         Same shape as apply_proxy_slots(): settings.json is the source of
@@ -4689,7 +4694,8 @@ class AccountPool(object):
         needs no extra settings lookup. `values` is the guard resolved per
         realm ({"global": g, "intl": ..., "cn": ...}); each account picks its
         own realm, so a per-realm override lands only on that realm's accounts
-        while the global default keeps covering both.
+        while the global default keeps covering both. `free_models` is the
+        caller's realm -> free-id catalogue view; None retains the last one.
         """
         import wb_settings
 
@@ -4698,6 +4704,9 @@ class AccountPool(object):
         with self._lock:
             for account in self.accounts:
                 account.reserve_credits = _realm_limit(values, account.realm)
+                if free_models is not None:
+                    account.free_models = frozenset(
+                        free_models.get(account.realm) or ())
         return values
 
     def apply_expiring_window(self, values=None):

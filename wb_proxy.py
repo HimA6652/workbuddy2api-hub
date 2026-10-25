@@ -2005,6 +2005,23 @@ def apply_daily_credit_limit(refresh=False):
     return POOL.apply_daily_credit_limit(limits, credits, free_models)
 
 
+def apply_reserve_credits(refresh=False):
+    """Publish the reserve and, only when it is on, the realm free ids.
+
+    This reuses the existing 60-second local catalogue cache; it never folds
+    usage logs or adds network work. The settings-save path passes refresh=True
+    so switching the guard off also clears the in-memory threshold.
+    """
+    if POOL is None:
+        return 0
+    values = wb_settings.limit_values(ACCOUNTS_DIR, "reserve_credits")
+    on = any(value > 0 for value in values.values())
+    if not on and not refresh:
+        return values
+    return POOL.apply_reserve_credits(
+        values, free_models_by_realm() if on else None)
+
+
 def apply_model_daily_token_limit(refresh=False):
     """Push the per-model daily token setting and today's counts into the pool."""
     if POOL is None:
@@ -14999,6 +15016,7 @@ def _open_upstream_attempts(payload, session_key=None, target_realm=None, prebui
     # share the same fold, and calling them separately paid for it three
     # times on every request.
     apply_daily_guards()
+    apply_reserve_credits()
     # 剩余用量优先调度（开关默认关）：把「估计剩余接近耗尽」的 (账号, 模型)
     # 权重推给池，让它们先接单。只在开关打开时读剩余估算（载荷有短 TTL，热路径
     # 上是缓存命中）；关着时推空表，把上一次可能留下的权重清掉，下一个请求就
@@ -20728,8 +20746,8 @@ class Handler(BaseHTTPRequestHandler):
         if limits_payload is not None:
             reply["limits"] = wb_settings.limits_snapshot(ACCOUNTS_DIR)
         if touched:
-            if POOL and "reserve_credits" in touched:
-                POOL.apply_reserve_credits()
+            if "reserve_credits" in touched:
+                apply_reserve_credits(refresh=True)
             if any(k in touched for k in ("daily_token_limit", "daily_credit_limit",
                                           "model_daily_token_limit")):
                 # One pass refreshes all three: a limit edit is rare, and the
@@ -24043,7 +24061,7 @@ def _bootstrap_runtime(args):
     POOL = wb_accounts.AccountPool(ACCOUNTS_DIR, log=log)
     POOL.load()
     POOL.apply_proxy_slots()
-    POOL.apply_reserve_credits()
+    apply_reserve_credits()
     # WB_MAX_CONCURRENT_CHAT=auto: size the chat ceiling from the pool that was
     # just loaded. Runs before the listener exists, so no request can hold a
     # slot yet and the semaphore swap is safe.

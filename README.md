@@ -176,7 +176,7 @@ python tests/run_all.py            # 全部套件
 python tests/run_all.py realm      # 只跑名字里含 realm 的
 ```
 
-- 244 个套件：182 个 Python + 62 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- 245 个套件：183 个 Python + 62 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - `tests/_mobile_check.py` 是独立的 Playwright 手机/桌面布局检查器（需自行安装 Playwright），按需手动运行，不在上面的套件集里。
 - CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12；推送 `v*` tag 时额外断言 **tag == 源码版本**（`-ci` 演练 tag 豁免）。
 
@@ -510,6 +510,7 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 
 下一版的改动记在这里；完整历史见 **[docs/CHANGELOG.md](docs/CHANGELOG.md)**。
 
+- **保留积分不再饿死免费模型**：正数 `reserve_credits` 只拦截付费或目录未知的模型；本区域目录标为 `x0.00` 的模型仍可派单。免费判定复用现有 `free_models_by_realm()`，默认 `reserve_credits=0`、账号级 `reserveBlocked` 状态和其他节流不变。新增 `tests/_test_reserve_free_models.py`（14 个用例）。 / A positive `reserve_credits` now blocks only paid or catalogue-unknown models. Models marked `x0.00` for the account's realm remain dispatchable, using the existing `free_models_by_realm()` view. The default reserve=0, account-level `reserveBlocked` state, and other throttles are unchanged. Adds `tests/_test_reserve_free_models.py` (14 cases).
 - **v1.10.1**：模型公共队列新增默认关闭的有界重试，6020 按上游 `retry_after` 秒数等待、6021 有界退避；客户端断开、热切换和预算耗尽均明确退出，失败保留原始 429。积分历史与看板共用同一时间区间，时序图横轴保留分钟并正确处理本地日界；修复重试边界与慢响应探针租约。完整变更与验证见 **[docs/CHANGELOG.md](docs/CHANGELOG.md#v1101)**。
 - **v1.10.0**：每日活跃遇到账号风控时按账号停手，签到支持并发、失败重试、任务计划与全局开关；调度进度跨重启保留，整点漏跑与热切换 PID 归属修复。模型入口的 `6020 / 6021` 队列错误按模型、产品和出口共享退避，单飞半开恢复，不再逐账号冷却和扫池。另修复面板设置与套餐筛选，以及模型目录缓存连续性。完整变更、实测数字与回滚方式见 **[docs/CHANGELOG.md](docs/CHANGELOG.md#v1100)**。
 - **v1.9.0 发布**：面板加载性能与零中断热更新。账号表改增量渲染、轮询 15 秒→60 秒；`/accounts` 载荷瘦身并把积分扫描转后台；看板与 API 响应启用 gzip；`wb_proxy` 新增 `/hotswap`，改完代码把监听句柄交给新进程，在途请求排空后再退出。完整变更、实测数字与回滚方式见 **[docs/CHANGELOG.md](https://github.com/HimA6652/workbuddy2api-hub/blob/main/docs/CHANGELOG.md#v190)**。
