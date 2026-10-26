@@ -22,7 +22,7 @@ python scripts/hotswap_update.py            # 默认 127.0.0.1:8788，面板 879
 2. `GET /hotswap/status` 确认对方支持热切换且当前 `phase == idle`（有请求在排空时拒绝）；
 3. `POST /hotswap` —— 旧进程 Popen 一个新进程把监听句柄继承过去，回执里直接带 `child_pid`；
 4. 拿旧 token 反复请求，直到 **401**（面板会话只活在进程内存里，401 就是"新进程在答"）；
-5. 重新登录，把新 PID 写进 `panel/run.pid`（面板读的就是这个文件）；
+5. 重新登录，问出新进程的 PID —— `/hotswap/status` 的 `pid` → `/health` 的 `pid`（仅回环来源才给）→ netstat 三级回落，写进 `panel/run.pid`（文件存在才写）。netstat 的 OwningPid 是 socket 创建者，热切换后指向早就退出的旧进程，不能当唯一来源；
 6. 等旧 PID 消失，最后 `GET /health`（可选再验一次 `/v1/models`）。
 
 退出码：`0` 成功；`2` 对方还不支持 `/hotswap` 且没有加 `--bootstrap`；`1` 其他失败。
@@ -181,9 +181,9 @@ python scripts\hotswap_update.py --bootstrap
 ## 6. 验证
 
 ```bash
-python tests/_test_hotswap.py       # 30 项：交接、排空、调度器互斥、压测
-python tests/_test_panel_status.py  # 15 项：幽灵 PID、conflict、坏配置
-python tests/run_all.py             # 全量
+python tests/_test_hotswap.py       # 32 项：交接、排空、调度器互斥、压测、/health 自述 PID
+python tests/_test_panel_status.py  # 21 项：幽灵 PID、自述优先、conflict、坏配置
+python tests/run_all.py             # 全量（237 个套件）
 ```
 
 `_test_hotswap.py` 用一个**临时实例**跑，不碰生产：
@@ -193,6 +193,13 @@ python tests/run_all.py             # 全量
 - 这时补发 body：那条慢请求仍由旧进程答完、body 收全、连接正常 EOF；
 - 全程 keep-alive 压测，断言连接级失败为 0；
 - 最后确认旧进程退出、调度器自动恢复。
+
+切完一次之后，两条 PID 必须对得上（这也是判断「谁真的在服务」最省事的办法）：
+
+```bash
+curl -s http://127.0.0.1:8788/health          # 回环来源才带 "pid": <新进程>
+curl -s http://127.0.0.1:8790/api/status      # "pid" 与上面一致，uptime 从 0 开始
+```
 
 ---
 
