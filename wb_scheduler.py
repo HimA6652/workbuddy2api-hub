@@ -9,6 +9,7 @@
 5. 状态持久化与看板展示：暴露状态、执行记录、支持手动立即触发与开关切换。
 """
 import io
+import json
 import os
 import threading
 import time
@@ -21,6 +22,11 @@ from wb_tasks import do_cat_travel
 #: 网页活跃时段到期后还能补多久（分钟）。两个时段相隔 12 小时，所以 12 小时既覆盖
 #: 「巡检被占住 / 进程重启 / 漏了一次 tick」，又不会把昨天没跑的时段补到今天。
 DAILY_CHAT_SLOT_GRACE_MINUTES = 720
+
+#: R7：网页活跃「今天哪些时段已经触发过」的状态文件（放在 accounts 目录下，
+#: 与 integration-state.json / 额度扫描状态同一套约定）。它只防同一个时段被
+#: 重复触发，不是历史记录；跨天自动作废。
+DAILY_CHAT_SLOT_STATE = "daily-chat-slots.json"
 #: 批次截止的余量（秒）：每个账号有自己的预算，批次再给一份等待/收尾的余量。
 DAILY_CHAT_BATCH_SLACK = 60
 #: 被放弃的工作线程最多留这么多条。它们通常几十秒内自己结束（每一轮的网络调用
@@ -120,9 +126,10 @@ class Scheduler:
         self.daily_chat_times = []
         # 生效时段是不是「今天随机抽的两个」（面板没填时段时的默认行为）。
         self.daily_chat_random_slots = True
-        # 今日已触发的网页活跃时段，防 30 秒轮询重复触发；重启后清空，
-        # 账号级 can_daily_chat() 仍会挡住当天已完成的账号。
+        # 今日已触发的网页活跃时段，防 30 秒轮询重复触发。状态落盘（R7）：
+        # 进程在时段窗口内重启 / 热切换后不再是空的，同一个时段不会被再触发一次。
         self._daily_chat_done = {}
+        self._daily_chat_done_loaded = False
         # 正在跑的网页活跃：uid8 -> {uid, started, budget}。面板要能看见「现在
         # 卡在哪个账号、还剩多少预算」，否则一次卡死只能是黑盒。
         self._daily_chat_live = {}
@@ -308,6 +315,57 @@ class Scheduler:
             pass
         return wait
 
+    def _daily_chat_slot_state_path(self):
+        directory = getattr(self.pool, "dir", "") or ""
+        return os.path.join(directory, DAILY_CHAT_SLOT_STATE) if directory else ""
+
+    def _load_daily_chat_done(self):
+        """把「今天哪些网页活跃时段已经触发过」从盘上读回来（R7）。
+
+        这份集合以前只活在内存里：进程在时段窗口内重启（含热切换）后被清空，
+        同一时段会被再触发一轮。当天已经成功的账号有 can_daily_chat() 挡着，
+        但没成功的那批会被重新排队——实测一次多重跑 5~9 分钟（intl 侧 169 个
+        启用号、并发 3 时尤其明显）。状态按天写盘，跨天自动作废。
+        """
+        path = self._daily_chat_slot_state_path()
+        if not path:
+            return {}
+        try:
+            with open(path, encoding="utf-8-sig") as fh:
+                payload = json.load(fh)
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:
+            self.log("! 网页活跃时段状态读取失败（按未跑处理）：%s" % exc)
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        day = str(payload.get("day") or "")
+        if day != time.strftime("%Y-%m-%d"):
+            return {}
+        slots = {str(slot) for slot in (payload.get("slots") or []) if slot}
+        return {day: slots} if slots else {}
+
+    def _save_daily_chat_done(self):
+        """原子写回时段状态；写不进去只记日志，不影响当轮触发。"""
+        path = self._daily_chat_slot_state_path()
+        if not path:
+            return
+        day = time.strftime("%Y-%m-%d")
+        payload = {"day": day,
+                   "slots": sorted(self._daily_chat_done.get(day) or [])}
+        tmp = path + ".tmp-%d" % os.getpid()
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception as exc:
+            self.log("! 网页活跃时段状态写盘失败：%s" % exc)
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
     def _due_daily_chat_slot(self, now=None):
         """The HH:MM web-activity slot due right now, or "" when none is.
 
@@ -321,6 +379,9 @@ class Scheduler:
         """
         if not self.daily_chat_times:
             return ""
+        if not self._daily_chat_done_loaded:
+            self._daily_chat_done_loaded = True
+            self._daily_chat_done.update(self._load_daily_chat_done())
         now = time.localtime() if now is None else now
         current = now.tm_hour * 60 + now.tm_min
         day = time.strftime("%Y-%m-%d", now)
@@ -342,6 +403,7 @@ class Scheduler:
             for other in list(self._daily_chat_done):
                 if other != day:
                     self._daily_chat_done.pop(other, None)
+            self._save_daily_chat_done()
             return slot
         return ""
 
@@ -665,9 +727,14 @@ class Scheduler:
         try:
             futures = {}
             for index, (acc, want) in enumerate(items):
-                delay = min(index * random.uniform(0.25, 0.6), 2.0)
-                futures[pool.submit(self._delayed_cn_tasks, acc, want, delay,
-                                    deadline)] = acc
+                # R2：错峰只花在冷启动的几个提交上。旧写法把
+                # min(index*0.25..0.6, 2.0) 交给 worker 执行，而 index 是提交
+                # 序号、线程池会复用 worker：第 8 个之后的每个账号都要在占着一个
+                # worker 的情况下多睡 2.0 秒（并发 3、158 个号 ≈ 多 105 秒）。错峰
+                # 的本意只是别让头几个请求同一毫秒打到上游。
+                if 0 < index <= concurrency:
+                    time.sleep(random.uniform(0.2, 0.4))
+                futures[pool.submit(self._run_cn_tasks, acc, want, deadline)] = acc
             timeout = None if deadline is None else max(1.0, deadline - time.time())
             try:
                 for future in as_completed(futures, timeout=timeout):
@@ -694,6 +761,10 @@ class Scheduler:
         return counts
 
     def _delayed_cn_tasks(self, acc, want, delay, deadline):
+        """历史垫片：只在并发批量的老实现里用过，现已无调用点。
+
+        保留函数体只为兼容外部脚本的按名引用；错峰已挪到提交侧（见 R2）。
+        """
         if delay:
             time.sleep(delay)
         try:
@@ -932,8 +1003,11 @@ class Scheduler:
         try:
             futures = {}
             for index, acc in enumerate(accounts):
-                delay = min(index * 0.3, 2.0)
-                futures[pool.submit(self._delayed_daily_chat, acc, delay)] = acc
+                # R2：同上，错峰留在提交侧（只前 concurrency 个），不再让每个
+                # worker 各睡 2 秒。
+                if 0 < index <= concurrency:
+                    time.sleep(random.uniform(0.2, 0.4))
+                futures[pool.submit(self._run_one_daily_chat, acc)] = acc
             timeout = None if deadline is None else max(1.0, deadline - time.time())
             try:
                 for future in as_completed(futures, timeout=timeout):
@@ -962,6 +1036,7 @@ class Scheduler:
         return count
 
     def _delayed_daily_chat(self, acc, delay):
+        """历史垫片：并发批量已改在提交侧错峰（见 R2），这里保留按名兼容。"""
         if delay:
             time.sleep(delay)
         return self._run_one_daily_chat(acc)

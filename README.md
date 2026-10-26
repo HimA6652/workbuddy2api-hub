@@ -22,7 +22,7 @@
 This project is for protocol research and personal use only. Prefer the official client, do not use your primary account, and do not resell or share access.
 
 <p align="center">
-  <a href="https://github.com/HimA6652/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v1.9.0-2496ED?style=flat-square" alt="Version 1.9.0"></a>
+  <a href="https://github.com/HimA6652/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v1.10.0-2496ED?style=flat-square" alt="Version 1.10.0"></a>
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-Intl_&_CN-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -176,7 +176,7 @@ python tests/run_all.py            # 全部套件
 python tests/run_all.py realm      # 只跑名字里含 realm 的
 ```
 
-- 235 个套件：176 个 Python + 59 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- 237 个套件：178 个 Python + 59 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - `tests/_mobile_check.py` 是独立的 Playwright 手机/桌面布局检查器（需自行安装 Playwright），按需手动运行，不在上面的套件集里。
 - CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12；推送 `v*` tag 时额外断言 **tag == 源码版本**（`-ci` 演练 tag 豁免）。
 
@@ -497,6 +497,7 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 
 <!-- 发版时：把下面的 Unreleased 段落整理成新版本号（## vX.Y.Z），整体移入 docs/CHANGELOG.md 顶部 -->
 
+- **v1.10.0**：签到跑道重做，并让每日活跃在撞到风控时按账号停手。任务跑道从「整点串行、做错了没人知道、想暂停只能挨个改账号」改成可观测、可并发、可配置的一条跑道：空闲巡检不再为「什么都不做」逐个睡 2~5 秒（实测一轮 2000 秒 → 0 次等待），签到并批 + 瞬态失败退避重试 + 凭证前拦，新增 `GET /tasks/checkin/plan` 逐账号给出「为什么签不了」，状态机落盘重启不丢当天窗口；国际版每日活跃遇到 403/11140 现在按账号停手 2 小时并落盘，不再每轮白撞 6 次、也不再让整池连坐暂停；网页活跃的时段进度落盘（热切换/重启不再重跑当天已过时段），错峰等待从 worker 内挪到提交侧（60 号并发 3 实测 39.1 秒 → 1.8 秒）。完整变更、实测数字与回滚方式见 **[docs/CHANGELOG.md](https://github.com/HimA6652/workbuddy2api-hub/blob/main/docs/CHANGELOG.md#v1100)**。
 - **v1.9.0 发布**：面板加载性能与零中断热更新。账号表改增量渲染、轮询 15 秒→60 秒；`/accounts` 载荷瘦身并把积分扫描转后台；看板与 API 响应启用 gzip；`wb_proxy` 新增 `/hotswap`，改完代码把监听句柄交给新进程，在途请求排空后再退出。完整变更、实测数字与回滚方式见 **[docs/CHANGELOG.md](https://github.com/HimA6652/workbuddy2api-hub/blob/main/docs/CHANGELOG.md#v190)**。
 - **v1.8.0 发布**：汇总 v1.7.33 之后的 #640、#642、#643、#645/#647，并补齐 #578、#618、#625 的发布记录。完整变更、验证范围与已知限制见 **[docs/CHANGELOG.md](https://github.com/HimA6652/workbuddy2api-hub/blob/main/docs/CHANGELOG.md#v180)**；下一版的改动继续写在本段。
 - **修正 CN 专属模型判定，并给 OpenCode 写入真实上下文上限**（#618 / #625）：`minimax-` 曾被当成整个模型家族的 CN 专属前缀，于是国际版也提供的 `minimax-m3.1-flash` 被本地 400 拦下。现在只保留确定的 CN 独占项（`deepseek-v4-pro*` 与显式 `minimax-m3`），同族其他模型按出口实际目录判断。OpenCode 一键配置此前只写空的模型条目，客户端只能回落到自己的 200k 默认值；现在把网关目录中的 `context_window` / `max_output` 写进 `limit.context` / `limit.output`，没有规格的条目仍保持空对象。新增回归覆盖。 / Narrow the China-only model gate and give OpenCode the real context limit (#618 / #625): `minimax-` used to mark the whole family as CN-exclusive, so the globally served `minimax-m3.1-flash` was refused locally with a 400. Only the confirmed China-only entries remain (`deepseek-v4-pro*` and the explicit `minimax-m3`); other members of the family follow the actual catalogue of the selected exit. OpenCode's one-click config used to write empty model entries, so it fell back to its own 200k default; the gateway's catalogue `context_window` / `max_output` now go into `limit.context` / `limit.output`, while entries without specs stay empty objects. Regression coverage added.
@@ -590,7 +591,7 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 - **DSH 一键配置放宽限流重试，修掉「对话到一半链接中断」**：WorkBuddy 的 429 冷却通常约一分钟，而 DSH 的默认 `retryPolicy` 是 `normal` / 最多 5 次 / 退避 500ms 起翻倍、封顶 10s——加起来不到 16 秒就放弃，冷却还没结束回合就以 `RATE_LIMIT` 失败。一键配置现在给 `wb-proxy` 单独写 `retryPolicy: {mode: normal, maxRetries: 8, backoff: {initialDelayMs: 2000, maxDelayMs: 30000, jitterRatio: 0.1}}`（合计约 2 分半），只影响 `wb-proxy`，其它 provider 仍用默认策略；字段与取值按 `@deepseek-ai/dsh-llm` 的 `RetryPolicySchema`。已经接入过的机器重新点一次「一键配置」即可补上这段（幂等），重启 DSH 生效。
   DSH's default per-provider retry policy (normal, at most 5 retries, 500ms→10s backoff, under 16 seconds in total) gives up before WorkBuddy's ~60s rate-limit cooldown ends, so the turn dies with `RATE_LIMIT` — which the user sees as the conversation breaking mid-flight. The one-click config now writes a wider `retryPolicy` for `wb-proxy` only (8 retries, 2s initial delay, 30s cap, ~2.5 minutes in total); other providers keep the default policy. Field names and bounds follow `@deepseek-ai/dsh-llm`'s `RetryPolicySchema`. Re-running the one-click config on an already-integrated machine adds it idempotently, and a DSH restart applies it.
 
-已发布版本的完整记录（v1.4.5 ~ v1.9.0，含每版的 PR 归属）见 **[docs/CHANGELOG.md](https://github.com/HimA6652/workbuddy2api-hub/blob/main/docs/CHANGELOG.md)**。
+已发布版本的完整记录（v1.4.5 ~ v1.10.0，含每版的 PR 归属）见 **[docs/CHANGELOG.md](https://github.com/HimA6652/workbuddy2api-hub/blob/main/docs/CHANGELOG.md)**。
 
 ## 七、致谢与引用声明 (Credits & References)
 

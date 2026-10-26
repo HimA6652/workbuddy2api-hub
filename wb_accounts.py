@@ -2116,6 +2116,10 @@ class Account(object):
     def can_daily_chat(self):
         if self.realm != "intl":
             return False
+        # 上游风控限制期内的账号不再发每日活跃（见 note_restricted）：打卡只是加分
+        # 动作，对已经 403 / code 11140 的号再试一次，换不来积分，只会继续喂风控。
+        if self.restricted_until > time.time():
+            return False
         if not self.last_daily_chat:
             return True
         today_str = time.strftime("%Y-%m-%d")
@@ -2672,11 +2676,46 @@ class Account(object):
         # 当日活跃成功后再触发（下一个定时点、手动补跑、并发重复调度）直接
         # 跳过，连桌面腿也不发：这一天的 30/50 积分已经拿到了。
         if not self.can_daily_chat():
+            if self.restricted_until > time.time():
+                return {"ok": False, "skipped": True, "restricted": True,
+                        "error": "上游风控限制剩余 %d 秒"
+                                 % int(self.restricted_until - time.time()),
+                        "msg": "账号处于上游风控限制期，跳过本轮"}
             return {"ok": True, "skipped": True,
                     "msg": "今日活跃已完成，跳过本轮"}
         res = self._daily_chat_upstream(web)
         wb_activity.record_attempt(self, wb_activity.TASK_DAILY_CHAT, trigger, res)
         return res
+
+    def _note_daily_chat_restriction(self, detail):
+        """每日活跃撞上 403 / code 11140：按账号停手 2 小时，并把状态落盘。
+
+        这条腿以前只把错误串交给调度器，账号状态一个字都不写：于是同一个已被
+        上游限制的号，每个定时点都被重新排上（实测 2026-10-26 有 158 个 intl 号
+        一天白打 961 次 403），而调度器的「跳过受限账号」「区域连坐暂停」两道闸门
+        全都看不到它们（restrictedFor 一直是 0）。
+
+        这里**不**向 wb_proxy.note_account_restriction 记连坐事件，是有意的：
+        那条链面向实时服务与「一键测试」——新冒出来的 11140 说明上游正在按设备
+        清扫，整池该停；而离线打卡反复撞上同一批早已被封的号并不说明「现在正在
+        清扫」，若也记事件，整池会每两小时停一次派发，把还能用的那几个号一起停掉
+        （intl 侧当天仍有 3 个号真跑通）。停手按账号生效，服务侧的连坐保护不变。
+        """
+        import wb_proxy
+        try:
+            until = self.note_restricted(detail)
+        except Exception:
+            until = time.time() + RESTRICTED_ACCOUNT_COOLDOWN
+        try:
+            if self.path and os.path.exists(os.path.dirname(self.path)):
+                self.save(os.path.dirname(self.path))
+        except Exception as exc:
+            wb_proxy.log("account %s: daily-chat restriction not persisted: %s"
+                         % ((self.uid or "?")[:8], exc))
+        return {"ok": False, "restricted": True,
+                "error": "HTTP 403 (account restricted): %s" % str(detail)[:400],
+                "msg": "上游风控限制，已停手 %d 秒"
+                       % max(0, int(until - time.time()))}
 
     def _daily_chat_upstream(self, web=None):
         """每日活跃对话的实际流程；返回形状见 daily_chat。"""
@@ -2770,7 +2809,9 @@ class Account(object):
                 err = exc.read().decode("utf-8", "replace")
             except Exception:
                 err = str(exc)
-            return {"ok": False, "error": f"HTTP {exc.code}: {err[:100]}"}
+            if exc.code == 403 and wb_proxy.restriction_is_account_level(err):
+                return self._note_daily_chat_restriction(err)
+            return {"ok": False, "error": f"HTTP {exc.code}: {err[:400]}"}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
