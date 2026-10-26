@@ -1,6 +1,6 @@
-## 未发布（自用分支）
+## v1.9.0
 
-自用分支上的四项改动。前两项针对「面板卡」与「改代码必须停网关」，后两项是面板载荷与服务端压缩；都只动自用分支，没有向上游提交。套件 229 个（170 Python + 59 JS）。
+本版四项改动：前两项针对「面板卡」与「改代码必须停网关」，后两项是面板载荷与服务端压缩；自用分支实现，未向上游提交。套件 229 个（170 Python + 59 JS）。
 
 - **改完代码零中断换进程**（`scripts/hotswap_update.py` + `POST /hotswap`）：旧进程把监听 socket 以可继承句柄交给新进程（`close_fds=False` + `_inheritable_handle`），新进程 `accept` 成功并写好接管标记后，旧进程才停 `accept`、关闭调度器、排空手上请求再退出。实测接管 0.35–0.46 秒，7481–8925 次 keep-alive 请求 0 失败；首次升级旧版（没有 `/hotswap` 的进程）需要一次 `--bootstrap`，实测断档 3.92 秒。`--hotswap-from-pid` 让新进程按住调度器直到旧进程真正消失，避免两个进程同时签到。详见 `docs/HOT-UPDATE.md`。
 - **面板状态不再被 netstat 的僵尸 PID 带偏**：热切换后 TCP 表里的 `OwningPid` 仍是 socket 的创建者，可能早已退出、句柄却被新进程用着。`Controller.snapshot()` 现在先验证 PID 存活（死了就当没查到，再回落到 `run.pid`），`hotswap_update.py` 的 `listening_pid()` 同样收集候选后逐个复核；面板显示的 PID / 运行时长与「停止」按钮重新指向真正在服务的进程。顺带把 `log_panel` 提到 `load_config` 之前，坏掉的 `config.json` 不再以 `NameError` 收场。
@@ -10,6 +10,7 @@
 验证：本地完整矩阵 `229 passed, 0 failed, 0 skipped`（`--jobs 4`，81.7 秒）+ `scripts/check_clean_checkout.py`；热切换单独覆盖 30 项（普通解释器与 venv 的 `pythonw.exe` 转发链各跑一遍），面板状态机 15 项，缓存与压缩头 50 项。
 
 回滚：`git revert` 对应提交；线上回滚见 `docs/HOT-UPDATE.md` 的「回滚」一节（还原 `wb_proxy.py.bak-*` 后 `POST /api/restart`，或用 `scripts/hotswap_update.py` 热切回旧文件）。
+
 ## v1.8.0
 
 本版汇总 `v1.7.33` 之后的四个修复，并补记此前已进入发布页、但未写入仓库 CHANGELOG 的三项改动。套件 226 个（167 Python + 59 JS）。
