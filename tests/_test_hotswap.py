@@ -201,6 +201,13 @@ try:
     check("active=1（自己）", state.get("active") == 1, state)
     check("draining=false", state.get("draining") is False, state)
 
+    print("[1b] /health 自述 PID（热切换之后面板靠它认回真进程）")
+    _s, _h, body = request("GET", "/health")
+    health = as_json(body) or {}
+    check("health 里有 pid", isinstance(health.get("pid"), int), health)
+    check("pid 与 /hotswap/status 报的一致", health.get("pid") == state.get("pid"),
+          (health.get("pid"), state.get("pid")))
+
     print("[2] 没有面板会话：POST /hotswap 被拒，服务照旧")
     saved, TOKEN = TOKEN, None
     status, _h, _b = request("POST", "/hotswap")

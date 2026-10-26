@@ -120,6 +120,22 @@ try:
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
+print("[6] 网关在 /health 里自述 PID（热切换之后唯一可信的来源）")
+state = snapshot_with(mod, port_pid=4242, runpid=None, live=(7777,),
+                      health=("ok", {"ok": True, "accounts": 0, "pid": 7777}))
+check("状态 running", state["state"] == "running", state)
+check("pid 取网关自述", state["pid"] == 7777, state["pid"])
+check("不是那个已退出的属主", state["pid"] != 4242, state["pid"])
+state = snapshot_with(mod, port_pid=4242, runpid=5555, live=(5555, 7777),
+                      health=("ok", {"ok": True, "accounts": 0, "pid": 7777}))
+check("自述与 run.pid 都活时优先自述", state["pid"] == 7777, state["pid"])
+state = snapshot_with(mod, port_pid=4242, runpid=None, live=(),
+                      health=("ok", {"ok": True, "accounts": 0, "pid": 7777}))
+check("自述 PID 也已经死了就当没查到", state["pid"] is None, state["pid"])
+state = snapshot_with(mod, port_pid=4242, runpid=None, live=(7777,),
+                      health=("ok", {"ok": True, "accounts": 0}))
+check("老版本 /health 没有 pid 时不受影响", state["pid"] is None, state["pid"])
+
 print()
 print("PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

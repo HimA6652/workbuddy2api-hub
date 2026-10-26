@@ -307,6 +307,15 @@ class Controller:
         kind, health = probe_health()
         pid = port_pid
         known_pid = read_pidfile()
+        # 网关在 /health 里回报自己的 PID（只有回环来源才给）。热切换之后
+        # OwningPid 指向的是早就退出的 socket 创建者，这份自述才是"谁在服务"
+        # 最可信的来源，比 run.pid 还不容易过期。
+        health_pid = None
+        if kind == "ok" and isinstance(health, dict):
+            try:
+                health_pid = int(health.get("pid") or 0) or None
+            except (TypeError, ValueError):
+                health_pid = None
         with self.state_lock:
             busy = self.lock.locked() and not ignore_busy
             busy_action = (self.last_action.get("action") if busy else None)
@@ -315,6 +324,8 @@ class Controller:
             # 当成本机进程，否则面板会显示一个幽灵 PID，"停止"也会照着它去结束。
             if pid is not None and not pid_alive(pid):
                 pid = None
+            if pid is None and health_pid and pid_alive(health_pid):
+                pid = health_pid
             # 端口没在听（或属主已死）时，才回落到 PID 文件；且必须复核进程仍活着，
             # 否则上一轮留下的 stale pid 会伪造出一个"幽灵进程"。
             if pid is None and known_pid and pid_alive(known_pid):

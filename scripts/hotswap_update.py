@@ -110,6 +110,26 @@ def listening_pid(port):
     return None
 
 
+def health_pid(base):
+    """网关自述的 PID（GET /health 的 pid 字段，仅回环来源才给）。
+
+    netstat 的 OwningPid 是 socket 的创建者，热切换之后指向早已退出的旧进程；
+    新进程在 /health 里报自己的 os.getpid()，这是最准的一手信息。老版本没有
+    这个字段，返回 None 让调用方退回 netstat。
+    """
+    try:
+        code, text = _http("GET", base + "/health", timeout=10)
+    except Exception:
+        return None
+    if code != 200:
+        return None
+    try:
+        pid = int((_json(text) or {}).get("pid") or 0)
+    except (TypeError, ValueError):
+        return None
+    return pid if pid and pid_alive(pid) else None
+
+
 def load_password(args):
     if args.password:
         return args.password
@@ -267,9 +287,14 @@ def main(argv=None):
 
     token = login(base, password)
     code, text = status(base, token)
-    new_state = _json(text)
-    new_pid = new_state.get("pid") or listening_pid(args.port)
-    print("  现在服务的是 PID %s" % new_pid)
+    new_state = _json(text) if code == 200 else {}
+    if not isinstance(new_state, dict):
+        new_state = {}
+    new_pid = new_state.get("pid") or health_pid(base) or listening_pid(args.port)
+    if new_pid:
+        print("  现在服务的是 PID %s" % new_pid)
+    else:
+        print("  交接完成，但没问出新进程的 PID（面板和 /hotswap/status 仍可查）")
 
     if pidfile and new_pid:
         if write_pidfile(pidfile, new_pid):

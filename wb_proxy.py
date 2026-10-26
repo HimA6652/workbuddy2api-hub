@@ -19146,6 +19146,12 @@ class Handler(BaseHTTPRequestHandler):
                 "credential_file": os.path.basename(rep.path) if rep and rep.path else None,
                 "expires_at": rep.expires_at if rep else None,
             })
+        # 热切换之后 TCP 表里的 OwningPid 仍然是监听 socket 的创建者——那个进程
+        # 早就退出了，句柄却被接管的新进程继续用着，于是面板按 OwningPid 找不到
+        # 人（显示幽灵 PID 或者干脆没有 PID，"停止"也就无从下手）。回环来源才
+        # 回报自己的 PID，让本机面板把"谁在服务"认回来；对局域网一律不暴露。
+        if agents_client_allowed(getattr(self, "client_address", None)):
+            info["pid"] = os.getpid()
         return self._json(200, info)
     # Accept the conventional /v1 prefix and the bare path, because clients
     # differ in whether they append "/v1" themselves.
