@@ -147,6 +147,8 @@ class Scheduler:
         self._scan_thread = None
         self.last_run_time = None
         self.next_run_time = None
+        # 整点轮的去重键（年月日时）。空 = 本进程还没跑过任何整点轮。
+        self._last_hour_fire = ""
         self.logs = []
         # Guards against overlapping runs: trigger_now() spawns a thread per
         # click, and a manual trigger can also land on top of the hourly job.
@@ -246,14 +248,17 @@ class Scheduler:
                     except Exception as exc:
                         self.log(f"网页活跃排程执行异常: {exc}")
                     time.sleep(35)
-                # 到达设定的整点前 1 分钟内触发
-                if cur_min == 0 and cur_hour in self.all_hours:
+                # 整点轮：这一小时里有空就触发一次。旧写法只在 :00 那一分钟
+                # 检查，长轮次或热切换正好跨过这一分钟，这个整点就漏掉了。
+                if self._due_hour_cycle(now):
+                    self._last_hour_fire = self._hour_fire_key(now)
                     reason = f"整点排程命中 ({cur_hour}:00)"
                     try:
                         self._execute_cycle(reason)
                     except Exception as exc:
                         self.log(f"排程执行异常: {exc}")
-                    time.sleep(65) # 避开当前这一分钟重复触发
+                    # 去重交给 _last_hour_fire，这里只让出控制权。
+                    time.sleep(5)
             # 模型额度窗口探针：不受 enabled 影响。窗口是按首次请求起算的，
             # 到点没人请求就不会开始新一轮，这件事跟签到/保活开关无关。
             self._run_window_probes()
@@ -406,6 +411,26 @@ class Scheduler:
             self._save_daily_chat_done()
             return slot
         return ""
+
+    def _hour_fire_key(self, now=None):
+        """整点轮的去重键：年月日时（同一小时只跑一轮）。"""
+        now = time.localtime() if now is None else now
+        return "%04d-%02d-%02d-%02d" % (now.tm_year, now.tm_mon, now.tm_mday,
+                                        now.tm_hour)
+
+    def _due_hour_cycle(self, now=None):
+        """整点巡检现在该不该跑。
+
+        旧写法只在 cur_min == 0 那一分钟检查：循环这会儿正在跑长轮次、或者
+        进程刚好在热切换，这一分钟的检查就整个被跳过，当天那个整点轮（比如
+        22:00 的 Token 保活）一次都不会跑，而且没有任何补拍。改成「落在配置
+        小时内的任意一分钟都可以触发，每小时只触发一次」：空闲时仍在 :00 触
+        发，被占用时等这一轮跑完立刻补上。
+        """
+        now = time.localtime() if now is None else now
+        if now.tm_hour not in self.all_hours:
+            return False
+        return self._hour_fire_key(now) != self._last_hour_fire
 
     def _reload_schedule(self):
         """Re-read the configurable hours; keep the current grid on failure.
@@ -601,6 +626,10 @@ class Scheduler:
         self.last_run_time = time.strftime("%Y-%m-%d %H:%M:%S")
         self.log(f"开始执行任务 ({trigger_reason})...")
         self._reload_accounts_if_changed()
+        if not daily_chat_only:
+            # 完整巡检（含启动补跑）已经覆盖了当前这个整点，别在同一小时里
+            # 再触发一次；网页活跃单独触发的轮次不算，它不跑整点任务。
+            self._last_hour_fire = self._hour_fire_key()
         if not self.pool or not self.pool.accounts:
             self.log("暂无可用的活跃账号，跳过本次巡检")
             return

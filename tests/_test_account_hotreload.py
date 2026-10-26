@@ -2,7 +2,7 @@
 
 调度器每轮开头会调 AccountPool.reload_if_changed()：
 
-- 目录签名 = (json 文件数, 最大 mtime_ns, 总字节数)；签名不变就返回
+- 目录签名 = (json 文件数, 最大 mtime_ns, 总字节数, 文件名集)；签名不变就返回
   {"changed": False, ...}，绝不重载——否则每轮 load() 都会把运行态
   （token_expired / 冷却 / 熔断）清掉；
 - 签名变了才 load()，并给出 uid 集合的 added / removed，写一条 self.log；
@@ -101,6 +101,25 @@ class ReloadIfChangedTests(unittest.TestCase):
         self.assertEqual(result["removed"], [])
         self.assertEqual(result["checked"], 3)
         self.assertEqual(self._uids(), ["uid-a", "uid-b", "uid-c"])
+
+    def test_equal_size_rename_in_the_same_clock_tick_is_seen(self):
+        """一删一增、长度相同、mtime 落在同一刻度：签名仍要看出变化。
+
+        生产上面板「改 uid」就是这个形状。Windows 的文件时间戳取自约 15.6ms 的
+        时钟中断，两张等长的号卡可以拿到完全相同的 mtime_ns（本套件在 --jobs 4
+        下就这样偶发漏判过 changed=false）：只靠「个数 + 最大 mtime + 总字节」是
+        看不出区别的，签名里的文件名集兜住它。
+        """
+        self.pool.reload_if_changed()
+        old_path = os.path.join(self.directory, "uid-b.json")
+        st = os.stat(old_path)
+        os.remove(old_path)
+        new_path = _write(self.directory, "uid-z", "Z", mtime_ns=st.st_mtime_ns)
+        self.assertEqual(os.path.getsize(new_path), st.st_size)
+        result = self.pool.reload_if_changed()
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["added"], ["uid-z"])
+        self.assertEqual(result["removed"], ["uid-b"])
 
     def test_removed_file_is_reported(self):
         self.pool.reload_if_changed()

@@ -4284,17 +4284,26 @@ class AccountPool(object):
 
     @staticmethod
     def _signature_from(stats):
-        """把逐文件 stat 折成规范要求的签名：(json 文件数, 最大 mtime_ns, 总字节数)。"""
+        """把逐文件 stat 折成签名：(json 文件数, 最大 mtime_ns, 总字节数, 文件名集)。
+
+        前三项便宜到可以每轮跑，只回答「有没有东西变了」；第四项兜住「一删一增」：
+        删掉 uid-b、新增等长的 uid-z，如果两次写入落在同一个系统时钟刻度上，
+        前三项一字不差，热重载就会静默漏掉这次改动。这不是理论问题——Windows 的
+        文件时间戳取自约 15.6ms 的时钟中断，实测同一轮账号热重载测试里两张等长
+        号卡的 mtime_ns 完全相同（--jobs 4 下偶发把 changed 判成 false）。面板上
+        「改 uid」与「删一个建一个」正好是这个形状。文件名集合小（一个文件一个
+        字符串），排序一次的代价远低于前面逐个 stat。
+        """
         newest = 0
         total = 0
         for mtime_ns, size in stats.values():
             if mtime_ns > newest:
                 newest = mtime_ns
             total += size
-        return (len(stats), newest, total)
+        return (len(stats), newest, total, tuple(sorted(stats)))
 
     def _dir_signature(self):
-        """账号目录的轻量签名：(json 文件数, 最大 mtime_ns, 总字节数)。
+        """账号目录的轻量签名：(json 文件数, 最大 mtime_ns, 总字节数, 文件名集)。
 
         比逐个文件解析便宜得多，也足够发现「加了 / 删了 / 改了」：mtime 用纳秒，
         同一秒内的两次写入也区分得开；总字节数兜住「mtime 被工具改回原值」
