@@ -8,6 +8,7 @@
 4. 猫猫旅行与日常结算 (Cat Travel & Welfare)：自动派出猫猫旅行或领取归来奖励。
 5. 状态持久化与看板展示：暴露状态、执行记录、支持手动立即触发与开关切换。
 """
+import io
 import os
 import threading
 import time
@@ -90,6 +91,22 @@ def keepalive_due(expires_at, now=None, lead=None):
     return (exp - now) < lead
 
 
+def _settings_call(name, directory, default):
+    """读一个设置项；函数不存在（旧版本/被裁剪）或读失败时回落默认值。
+
+    P0-P3 这批开关都放在 wb_settings 里，但调度器不能因为某个开关还没落地就
+    整轮不跑——缺函数、坏 JSON、读盘报错一律按默认值继续。
+    """
+    if not directory:
+        return default
+    func = getattr(wb_settings, name, None)
+    if not callable(func):
+        return default
+    try:
+        return func(directory)
+    except Exception:
+        return default
+
 class Scheduler:
     def __init__(self, pool):
         self.pool = pool
@@ -142,6 +159,7 @@ class Scheduler:
             self.logs.append(entry)
             if len(self.logs) > 60:
                 self.logs = self.logs[-60:]
+        self._append_task_log(entry)
         try:
             proxy = _proxy_module()
             # 任务/打卡/旅行类条目同时进入 tasks 模块日志，方便分类查看
@@ -156,6 +174,30 @@ class Scheduler:
         except Exception:
             pass
 
+    def _task_log_path(self):
+        """P2-4：调度日志落盘到 <root>/logs/tasks-YYYYMMDD.log。
+
+        面板与 /logs 只留最近 2000 条（约 1.5 小时），而 09:00 那轮「到底签了
+        几个、谁被跳过」恰恰是事后最想查的——内存环一冲就没了。
+        """
+        directory = getattr(self.pool, "dir", "") or ""
+        if not directory:
+            return ""
+        root = os.path.dirname(os.path.abspath(str(directory)))
+        return os.path.join(root, "logs", "tasks-%s.log" % time.strftime("%Y%m%d"))
+
+    def _append_task_log(self, entry):
+        path = self._task_log_path()
+        if not path:
+            return
+        try:
+            folder = os.path.dirname(path)
+            if folder and not os.path.isdir(folder):
+                os.makedirs(folder, exist_ok=True)
+            with io.open(path, "a", encoding="utf-8") as fh:
+                fh.write(entry + "\n")
+        except Exception:
+            pass
     def start(self):
         if self._thread and self._thread.is_alive():
             return
@@ -172,7 +214,7 @@ class Scheduler:
         # 启动后先休眠 10 秒等待主服务就绪，然后执行初次检查
         time.sleep(10)
         try:
-            self._execute_cycle("启动初次初始化巡检")
+            self._execute_cycle("启动初次初始化巡检", catchup_tasks=True)
         except Exception as exc:
             self.log(f"初次巡检异常: {exc}")
         # 进程停过一段时间的话，重置时刻可能已经过去：启动就补一次窗口探针，
@@ -374,55 +416,77 @@ class Scheduler:
         return {"ok": True, "msg": "已触发后台调度执行"}
 
     def _execute_cycle(self, trigger_reason="周期巡检", force=False,
-                       daily_chat_only=False):
+                       daily_chat_only=False, catchup_tasks=False):
         if not self._run_lock.acquire(blocking=False):
             self.log(f"跳过本次巡检 ({trigger_reason})：上一轮仍在执行")
             return
         try:
-            self._run_cycle(trigger_reason, force, daily_chat_only)
+            self._run_cycle(trigger_reason, force, daily_chat_only,
+                            catchup_tasks)
         finally:
             self._run_lock.release()
 
-    def _run_cycle(self, trigger_reason="周期巡检", force=False,
-                   daily_chat_only=False):
-        self.last_run_time = time.strftime("%Y-%m-%d %H:%M:%S")
-        self.log(f"开始执行任务 ({trigger_reason})...")
-        if not self.pool or not self.pool.accounts:
-            self.log("暂无可用的活跃账号，跳过本次巡检")
+    def _reload_accounts_if_changed(self):
+        """P3-2：账号文件被手工改过时，下一轮就按新内容调度，不必重启网关。"""
+        reload_fn = getattr(self.pool, "reload_if_changed", None)
+        if not callable(reload_fn):
             return
+        try:
+            result = reload_fn() or {}
+        except Exception as exc:      # noqa: BLE001 - 重载失败不该拖垮巡检
+            self.log(f"! 账号文件重载失败: {exc}")
+            return
+        if result.get("changed"):
+            self.log("账号文件有变化，已重新加载：新增 %s 个、移除 %s 个，当前 %s 个"
+                     % (len(result.get("added") or []),
+                        len(result.get("removed") or []),
+                        len(self.pool.accounts)))
 
-        refreshed_count = 0
-        checkin_count = 0
-        report_count = 0
-        travel_count = 0
-        daily_chat_count = 0
-        daily_chat_targets = []
-        cycle_hour = time.localtime().tm_hour
-        run_checkin = (not daily_chat_only
-                       and (force or cycle_hour in self.checkin_hours))
-        run_travel = (not daily_chat_only
-                      and (force or cycle_hour in self.travel_hours))
-        run_keepalive = (not daily_chat_only
-                         and (force or cycle_hour in self.keepalive_hours))
-        run_cat = (not daily_chat_only
-                   and (force or cycle_hour in self.cat_hours))
-        # 时段永远存在（面板留空时是「今天随机抽的两个」），所以国际版活跃只按
-        # 时段触发；启动后的第一次巡检额外补跑一次当天还没活跃的账号。
-        catchup = self._consume_startup_catchup()
-        run_daily_chat = (force or daily_chat_only or catchup
-                          or (not self.daily_chat_times and run_checkin))
+    def _tasks_dir(self):
+        return getattr(self.pool, "dir", "") or ""
 
-        for idx, acc in enumerate(list(self.pool.accounts)):
-            if idx > 0:
-                # 账号间随机错峰防并发风控（2~5秒浮动延时，issue #394）
-                time.sleep(random.uniform(2.0, 5.0))
+    def _tasks_concurrency(self):
+        return int(_settings_call("tasks_concurrency", self._tasks_dir(), 3) or 1)
+
+    def _tasks_budget(self):
+        return int(_settings_call("tasks_budget", self._tasks_dir(), 1800) or 0)
+
+    def _checkin_retries(self):
+        return int(_settings_call("checkin_retries", self._tasks_dir(), 2) or 0)
+
+    def _checkin_catchup_enabled(self):
+        return bool(_settings_call("checkin_startup_catchup", self._tasks_dir(), True))
+
+    def _checkin_enabled(self):
+        return bool(_settings_call("checkin_enabled", self._tasks_dir(), True))
+
+    def _plan_cycle_tasks(self, run_checkin, run_travel, run_cat, run_daily_chat,
+                          run_keepalive=True, run_report=None):
+        """P1-1：「要不要干活」先算清楚，再决定要不要为此等待。
+
+        旧实现在循环体最前面就 sleep(2~5s)，481 个账号里绝大多数什么也不用做
+        （今天已经签过、任务开关关着），照样睡满 1684 秒——一轮空转 28 分钟，
+        20 分钟内到点的下一个时段就被顶掉了。现在只统计，不发请求也不睡。
+        """
+        if run_report is None:
+            run_report = run_checkin
+        keepalive_items = []
+        cn_items = []
+        intl_targets = []
+        skips = {}
+
+        def bump(reason):
+            skips[reason] = skips.get(reason, 0) + 1
+
+        now = time.time()
+        for acc in list(self.pool.accounts):
             uid8 = acc.uid[:8] if acc.uid else "?"
             # 上游账号级风控限制（403 / code 11140）中的账号一律跳过：无人值守
             # 的巡检/打卡再去「试探」一次，只会让同一台设备上的其他账号连坐。
-            # 限制期限是持久化的（wb_accounts.note_restricted），重启后仍然有效。
-            if getattr(acc, "restricted_until", 0.0) > time.time():
+            if getattr(acc, "restricted_until", 0.0) > now:
                 self.log(f"跳过受限账号 [{uid8}]：上游风控限制剩余 "
-                         f"{int(acc.restricted_until - time.time())}s")
+                         f"{int(acc.restricted_until - now)}s")
+                bump("restricted")
                 continue
             # 区域级连坐暂停期间（同一窗口内多个账号被限制）整轮都不碰上游。
             try:
@@ -431,84 +495,287 @@ class Scheduler:
                 hold = 0.0
             if hold > 0:
                 self.log(f"跳过 [{uid8}]：{acc.realm} 区域风控暂停剩余 {int(hold)}s")
+                bump("region_hold")
                 continue
+            # Token 保活对所有账号都跑（它只续凭证，不代表账号参与任务）。低提前量
+            # 的账号一轮可能有几百个，同样不能让它们白等抖动。
+            if run_keepalive and keepalive_due(acc.expires_at or 0):
+                keepalive_items.append(acc)
             # Task participation is a separate switch from API dispatch: a
             # disabled account can still run check-in / growth / travel /
-            # daily activity (issue #521). Keepalive below stays on for every
-            # account - it only keeps the credential fresh.
-            task_active = acc.task_active()
-            rewards_ran = False
-            # 1. 检查 Token 剩余寿命（低于提前量就刷新保活）
-            if run_keepalive:
-                exp = acc.expires_at or 0
-                if keepalive_due(exp):
-                    if exp:
-                        left = int(exp - time.time())
-                        detail = f"剩余 {left}s" if left > 0 else f"已过期 {-left}s"
-                    else:
-                        detail = "到期时间未知"
-                    self.log(f"账号 [{uid8}] Token {detail}，执行主动保活刷新...")
-                    if acc.refresh():
-                        refreshed_count += 1
-                        self.log(f"✓ 账号 [{uid8}] Token 自动保活刷新成功")
-                    else:
-                        self.log(f"! 账号 [{uid8}] Token 保活刷新失败: {acc.last_error}")
-
-            # 2. 如果是国内版账号，检查每日签到与猫猫旅行
-            if acc.realm == "cn" and task_active:
+            # daily activity (issue #521).
+            if not acc.task_active():
+                bump("tasks_disabled")
+                continue
+            if acc.realm == "cn":
+                want = {}
                 if run_checkin:
                     if acc.can_checkin():
-                        self.log(f"检测到国内版账号 [{uid8}] 今日尚未签到，执行自动签到...")
-                        res = acc.checkin(trigger="scheduler")
-                        if res.get("ok"):
-                            checkin_count += 1
-                            self.log(f"✓ 账号 [{uid8}] 自动签到成功: {res.get('msg')}")
-                        else:
-                            self.log(f"! 账号 [{uid8}] 自动签到未成功: {res.get('error') or res.get('msg')}")
-                        time.sleep(1.0)
-
+                        want["checkin"] = True
+                    else:
+                        bump("already_today")
+                if run_report:
+                    # 活跃上报跟着签到时段走，但不跟着 checkin_enabled 停：暂停
+                    # 签到只是不领那笔积分，连登/热力墙没理由一起断。
                     if acc.can_report_activity():
-                        self.log(f"检测到国内版账号 [{uid8}] 今日尚未活跃上报，执行对话活跃上报...")
-                        res = acc.report_activity()
-                        if res.get("ok"):
-                            report_count += 1
-                            self.log(f"✓ 账号 [{uid8}] {res.get('msg')}")
-                        else:
-                            self.log(f"! 账号 [{uid8}] 对话活跃上报失败: {res.get('error') or res.get('msg')}")
-                        time.sleep(1.0)
-
+                        want["report"] = True
+                    else:
+                        bump("report_done")
                 if run_travel:
-                    # 检查猫猫旅行
-                    tr = do_cat_travel(acc)
-                    if tr.get("action") in ("claim", "depart"):
-                        travel_count += 1
-                        self.log(f"🐱 账号 [{uid8}] 猫猫日常处理: {tr.get('msg')}")
-                    time.sleep(1.0)
-
-                    # 连登管家闭环（补签保连登 -> 礼包/补偿 -> 连登兑换 -> 自动抽奖）
-                    bonus = wb_tasks.run_streak_bonus(acc)
-                    if bonus.get("logs"):
-                        for l in bonus["logs"]:
-                            self.log(f"★ 账号 [{uid8}] {l}")
-                        time.sleep(1.0)
-
+                    want["travel"] = True
                 if run_cat:
-                    # 01:00 夜猫子专属任务: black_cat 只在 23:00-08:00 上报计数,
-                    # 之前这个整点只是空转通用巡检, 从未真正上报过夜猫事件。
-                    night = wb_tasks.run_night_growth(acc)
-                    for line in night.get("logs", []):
-                        self.log(f"🌙 {line}")
-                    time.sleep(1.0)
-
-            # 3. 如果是国际版账号，检查每日活跃对话 (送 30/50 积分福利)
-            if acc.realm == "intl" and task_active and run_daily_chat:
+                    want["cat"] = True
+                if want:
+                    cn_items.append((acc, want))
+            elif acc.realm == "intl" and run_daily_chat:
                 if acc.can_daily_chat():
-                    daily_chat_targets.append(acc)
+                    intl_targets.append(acc)
+                else:
+                    bump("daily_chat_done")
+        return keepalive_items, cn_items, intl_targets, skips
 
-        if daily_chat_targets:
-            daily_chat_count = self._run_daily_chat_batch(daily_chat_targets)
+    def _run_cycle(self, trigger_reason="周期巡检", force=False,
+                   daily_chat_only=False, catchup_tasks=False):
+        self.last_run_time = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.log(f"开始执行任务 ({trigger_reason})...")
+        self._reload_accounts_if_changed()
+        if not self.pool or not self.pool.accounts:
+            self.log("暂无可用的活跃账号，跳过本次巡检")
+            return
 
-        self.log(f"巡检完成：Token保活 {refreshed_count} 个，国内签到 {checkin_count} 个，活跃上报 {report_count} 个，猫猫日常 {travel_count} 个，国际活跃 {daily_chat_count} 个")
+        started = time.time()
+        refreshed_count = 0
+        cycle_hour = time.localtime().tm_hour
+        # 启动补跑只消费一次（P3-1）：进程在时段内停过时，「今天已经过了时段」
+        # 不该等于「今天这件事就不做了」——签到/旅行/国际活跃都要补一轮。
+        catchup = self._consume_startup_catchup()
+        # P3-1：启动补跑只由「启动后第一轮巡检」触发（catchup_tasks=True）。
+        # 手工/整点触发的巡检仍旧严格按时段门禁——issue #515 之后，
+        # 「10:00 的巡检不该顺手把 09:00 的旅行再跑一遍」是明确的既有行为。
+        catchup_enabled = self._checkin_catchup_enabled()
+        missed_task_window = (catchup_tasks and catchup_enabled
+                              and any(h < cycle_hour for h in self.checkin_hours))
+        missed_travel_window = (catchup_tasks and catchup_enabled
+                                and any(h < cycle_hour for h in self.travel_hours))
+        checkin_enabled = self._checkin_enabled()
+        run_report = (not daily_chat_only
+                      and (force or cycle_hour in self.checkin_hours
+                           or missed_task_window))
+        run_checkin = run_report and checkin_enabled
+        if not checkin_enabled and not daily_chat_only:
+            self.log("签到已按设置暂停（checkin_enabled=false），本轮只跑其它任务")
+        run_travel = (not daily_chat_only
+                      and (force or cycle_hour in self.travel_hours
+                           or missed_travel_window))
+        run_keepalive = (not daily_chat_only
+                         and (force or cycle_hour in self.keepalive_hours))
+        run_cat = (not daily_chat_only
+                   and (force or cycle_hour in self.cat_hours))
+        if missed_task_window or missed_travel_window:
+            self.log("启动补跑：今天已经过了整点时段，补跑签到/旅行/活跃上报")
+        # 时段永远存在（面板留空时是「今天随机抽的两个」），所以国际版活跃只按
+        # 时段触发；启动后的第一次巡检额外补跑一次当天还没活跃的账号。
+        run_daily_chat = (force or daily_chat_only or catchup
+                          or (not self.daily_chat_times and run_checkin))
+
+        keepalive_items, cn_items, intl_targets, skips = self._plan_cycle_tasks(
+            run_checkin, run_travel, run_cat, run_daily_chat, run_keepalive,
+            run_report)
+
+        # 1. Token 保活（逐个刷新；数量少、且不参与抖动）
+        for acc in keepalive_items:
+            uid8 = acc.uid[:8] if acc.uid else "?"
+            exp = acc.expires_at or 0
+            if exp:
+                left = int(exp - time.time())
+                detail = f"剩余 {left}s" if left > 0 else f"已过期 {-left}s"
+            else:
+                detail = "到期时间未知"
+            self.log(f"账号 [{uid8}] Token {detail}，执行主动保活刷新...")
+            if acc.refresh():
+                refreshed_count += 1
+                self.log(f"✓ 账号 [{uid8}] Token 自动保活刷新成功")
+            else:
+                self.log(f"! 账号 [{uid8}] Token 保活刷新失败: {acc.last_error}")
+
+        # 2. 中文任务跑道（签到 / 活跃上报 / 猫猫旅行 / 连登 / 夜猫）
+        counts = self._run_cn_task_batch(cn_items)
+        # 3. 国际版每日活跃（本来就有自己的并发与预算）
+        daily_chat_count = self._run_daily_chat_batch(intl_targets) if intl_targets else 0
+
+        self.log(f"巡检完成：Token保活 {refreshed_count} 个，国内签到 {counts['checkin']} 个，"
+                 f"活跃上报 {counts['report']} 个，猫猫日常 {counts['travel']} 个，"
+                 f"国际活跃 {daily_chat_count} 个")
+        self._log_cycle_summary(trigger_reason, counts, refreshed_count,
+                                daily_chat_count, skips, started,
+                                len(cn_items) + len(intl_targets) + len(keepalive_items))
+
+    def _log_cycle_summary(self, trigger_reason, counts, refreshed_count,
+                           daily_chat_count, skips, started, candidates):
+        """P2-4：每轮一行汇总，跳过原因按类目计数。
+
+        「今天怎么一个都没签」这种问题，光看逐账号日志要翻几百行；一行汇总
+        直接给出候选、完成与跳过原因分布。
+        """
+        reasons = " ".join("%s=%d" % (k, v) for k, v in sorted(skips.items())) or "无"
+        self.log("巡检汇总（%s）：候选 %d，完成 签到 %d/上报 %d/旅行 %d/夜猫 %d，"
+                 "失败 %d，国际活跃 %d，保活 %d，跳过 %s，用时 %.1fs，"
+                 "旅行明细 已完成 %d/途中 %d"
+                 % (trigger_reason, candidates, counts["checkin"], counts["report"],
+                    counts["travel"], counts["cat"], counts["failed"],
+                    daily_chat_count, refreshed_count, reasons,
+                    max(0.0, time.time() - started),
+                    counts.get("travel_done", 0), counts.get("traveling", 0)))
+
+    def _deadline_hit(self, deadline):
+        return deadline is not None and time.time() > deadline
+
+    def _run_cn_task_batch(self, items):
+        """P1-2：中文任务批量化。
+
+        并发 1（或只有一个账号）走历史行为：逐个来、账号间隔 2~5 秒抖动。
+        高于 1 时用线程池 + 提交错峰 0.25~0.6 秒，整批受 tasks_budget 约束：
+        一个卡在上游的账号不能把整轮巡检拖住（这正是旧实现在 21:00 窗口跑满
+        52 分钟、把次日 01:00 时段顶掉的原因）。
+        """
+        counts = {"checkin": 0, "report": 0, "travel": 0, "cat": 0,
+                  "travel_done": 0, "traveling": 0, "failed": 0}
+        if not items:
+            return counts
+        concurrency = max(1, self._tasks_concurrency())
+        budget = self._tasks_budget()
+        deadline = (time.time() + budget) if budget > 0 else None
+        if concurrency <= 1 or len(items) <= 1:
+            for index, (acc, want) in enumerate(items):
+                if index > 0:
+                    # 账号间随机错峰防并发风控（2~5秒浮动延时，issue #394）
+                    time.sleep(random.uniform(2.0, 5.0))
+                if self._deadline_hit(deadline):
+                    self.log("中文任务本轮已到批次截止时间，剩余账号留到下一个时段")
+                    break
+                result = self._run_cn_tasks(acc, want, deadline)
+                for key in counts:
+                    counts[key] += int(result.get(key) or 0)
+            return counts
+
+        from concurrent.futures import (ThreadPoolExecutor, as_completed,
+                                        TimeoutError as FutureTimeout)
+        pool = ThreadPoolExecutor(max_workers=concurrency,
+                                  thread_name_prefix="tasks")
+        try:
+            futures = {}
+            for index, (acc, want) in enumerate(items):
+                delay = min(index * random.uniform(0.25, 0.6), 2.0)
+                futures[pool.submit(self._delayed_cn_tasks, acc, want, delay,
+                                    deadline)] = acc
+            timeout = None if deadline is None else max(1.0, deadline - time.time())
+            try:
+                for future in as_completed(futures, timeout=timeout):
+                    try:
+                        result = future.result() or {}
+                    except Exception as exc:      # noqa: BLE001 - 单个账号失败不中断整批
+                        acc = futures[future]
+                        uid8 = acc.uid[:8] if acc.uid else "?"
+                        self.log(f"! 账号 [{uid8}] 中文任务并发执行异常: {exc}")
+                        counts["failed"] += 1
+                        continue
+                    for key in counts:
+                        counts[key] += int(result.get(key) or 0)
+            except FutureTimeout:
+                pending = [acc for future, acc in futures.items()
+                           if not future.done()]
+                self.log("中文任务本轮已到批次截止时间，%d 个账号留到下一个时段"
+                         % len(pending))
+                counts["failed"] += len(pending)
+        finally:
+            # wait=False：卡住的 worker 不能把整轮巡检一起拖住（预算到点后它
+            # 自己会放弃当前账号）。
+            pool.shutdown(wait=False)
+        return counts
+
+    def _delayed_cn_tasks(self, acc, want, delay, deadline):
+        if delay:
+            time.sleep(delay)
+        try:
+            return self._run_cn_tasks(acc, want, deadline)
+        except Exception as exc:          # noqa: BLE001 - 记下来交给批次汇总
+            uid8 = acc.uid[:8] if acc.uid else "?"
+            self.log(f"! 账号 [{uid8}] 中文任务异常: {exc}")
+            return {"failed": 1}
+
+    def _run_cn_tasks(self, acc, want, deadline=None):
+        """一个账号的中文任务：签到 -> 活跃上报 -> 猫猫旅行/连登 -> 夜猫。"""
+        uid8 = acc.uid[:8] if acc.uid else "?"
+        counts = {"checkin": 0, "report": 0, "travel": 0, "cat": 0,
+                  "travel_done": 0, "traveling": 0, "failed": 0}
+        if want.get("checkin") and not self._deadline_hit(deadline):
+            self.log(f"检测到国内版账号 [{uid8}] 今日尚未签到，执行自动签到...")
+            res = self._checkin_with_retry(acc, deadline)
+            if res.get("ok"):
+                counts["checkin"] += 1
+                self.log(f"✓ 账号 [{uid8}] 自动签到成功: {res.get('msg')}")
+            else:
+                self.log(f"! 账号 [{uid8}] 自动签到未成功: {res.get('error') or res.get('msg')}")
+            time.sleep(1.0)
+        if want.get("report") and not self._deadline_hit(deadline):
+            self.log(f"检测到国内版账号 [{uid8}] 今日尚未活跃上报，执行对话活跃上报...")
+            res = acc.report_activity()
+            if res.get("ok"):
+                counts["report"] += 1
+                self.log(f"✓ 账号 [{uid8}] {res.get('msg')}")
+            else:
+                self.log(f"! 账号 [{uid8}] 对话活跃上报失败: {res.get('error') or res.get('msg')}")
+            time.sleep(1.0)
+        if want.get("travel") and not self._deadline_hit(deadline):
+            # 检查猫猫旅行
+            tr = do_cat_travel(acc)
+            action = tr.get("action")
+            if action in ("claim", "depart"):
+                counts["travel"] += 1
+                self.log(f"🐱 账号 [{uid8}] 猫猫日常处理: {tr.get('msg')}")
+            elif action == "idle":
+                # daily_limit_reached：今日旅行额度已用完。P2-4 要求「跳过」要能解释清楚，
+                # 否则「旅行 3」会被误读成只有 3 个号参与。
+                counts["travel_done"] += 1
+            elif action == "traveling":
+                counts["traveling"] += 1
+            time.sleep(1.0)
+            # 连登管家闭环（补签保连登 -> 礼包/补偿 -> 连登兑换 -> 自动抽奖）
+            bonus = wb_tasks.run_streak_bonus(acc)
+            if bonus.get("logs"):
+                for line in bonus["logs"]:
+                    self.log(f"★ 账号 [{uid8}] {line}")
+                time.sleep(1.0)
+        if want.get("cat") and not self._deadline_hit(deadline):
+            # 01:00 夜猫子专属任务: black_cat 只在 23:00-08:00 上报计数,
+            # 之前这个整点只是空转通用巡检, 从未真正上报过夜猫事件。
+            night = wb_tasks.run_night_growth(acc)
+            for line in night.get("logs", []):
+                self.log(f"🌙 {line}")
+            time.sleep(1.0)
+        return counts
+
+    def _checkin_with_retry(self, acc, deadline=None):
+        """P3-3 消费侧：瞬态失败（网络 / 5xx / 429）按 checkin_retries 退避重试。
+
+        5s、15s、45s……指数退避，受批次 deadline 约束：重试只是「别把一次网络
+        抖动当成今天没签」，不该把整批的时间预算吃掉。
+        """
+        retries = max(0, self._checkin_retries())
+        attempt = 0
+        delay = 5.0
+        while True:
+            res = acc.checkin(trigger="scheduler") or {}
+            if res.get("ok") or not res.get("transient") or attempt >= retries:
+                return res
+            if deadline is not None and time.time() + delay > deadline:
+                return res
+            attempt += 1
+            uid8 = acc.uid[:8] if acc.uid else "?"
+            self.log(f"… 账号 [{uid8}] 签到瞬态失败，{int(delay)}s 后重试"
+                     f"（第 {attempt}/{retries} 次）")
+            time.sleep(delay)
+            delay = min(delay * 3, 60.0)
 
     def _daily_chat_concurrency(self):
         directory = getattr(self.pool, "dir", "") or ""

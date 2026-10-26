@@ -18218,6 +18218,59 @@ def _release_key_slot(key_entry):
 BODYLESS_PANEL_POSTS = ("/console/toggle", "/shutdown", "/hotswap",
                         "/updates/check", "/updates/install", "/quota-scan/run")
 
+# ---- 签到候选判定（GET /tasks/checkin/plan 用，P2-1） ----------------------
+def _account_credential_usable(account):
+    """账号凭据现在能不能拿去打上游（P1-3 的 credential_usable 落地前后都走这里）。
+
+    P1-3 给 wb_accounts.Account 加了 credential_usable()：它比「有 token 且没过期」
+    多考虑刷新失败的冷却，是「凭据是否可用」的唯一口径。它还没落地（或者旧进程里
+    的账号对象没有这个方法）时退化成本端点原本的近似判据，不让接口 500。
+    """
+    usable = getattr(account, "credential_usable", None)
+    if callable(usable):
+        try:
+            return bool(usable())
+        except Exception:       # 判定函数自己炸了：保守按「不可用」处置
+            return False
+    return bool(getattr(account, "access_token", "")) and not getattr(
+        account, "token_expired", False)
+
+
+def checkin_plan_reason(account, now, checkin_enabled=True, holds=None):
+    """只读地判定「这个账号这一轮会不会被签」，返回 §2.3 的 reason 字符串。
+
+    判定顺序就是排查顺序：not_cn → api_key → enterprise → tasks_disabled →
+    credential_expired → restricted → region_hold → already_today →
+    checkin_paused → will_attempt。口径必须和 wb_scheduler._run_cycle 对齐：
+    调度器先按 restricted_until 与整池 hold 跳过，再要求 realm=="cn" 且
+    task_active() 且 can_checkin()；它**不**看 enabled（停用只影响派发，不影响
+    任务参与），这里也不看。
+
+    全过程只读账号上的现成属性加两个纯查询（不碰上游、不落盘），所以面板可以在
+    签到窗口里反复拉这个接口看进度，不会烧掉任何账号的额度。
+    """
+    if getattr(account, "realm", "") != "cn":
+        return "not_cn"
+    if getattr(account, "is_api_key", False):
+        return "api_key"
+    is_enterprise = getattr(account, "is_enterprise", None)
+    if callable(is_enterprise) and is_enterprise():
+        return "enterprise"
+    if not account.task_active():
+        return "tasks_disabled"
+    if not _account_credential_usable(account):
+        return "credential_expired"
+    if (getattr(account, "restricted_until", 0) or 0) > now:
+        return "restricted"
+    if (holds or {}).get(getattr(account, "realm", ""), 0) > 0:
+        return "region_hold"
+    if not account.can_checkin():
+        return "already_today"
+    if not checkin_enabled:
+        return "checkin_paused"
+    return "will_attempt"
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     # 关掉 Nagle（对连接设 TCP_NODELAY）：响应头和响应体是两次独立 write，Nagle
@@ -18990,6 +19043,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._get_usage_timeseries(query)
         if path == "/activity/history":
             return self._get_activity_history(query)
+        if path == "/tasks/checkin/plan":
+            # 签到候选快照（#§2.3）：只读，不发上游、不写盘。挂在 /tasks 同一处，
+            # 走同一个面板门（_is_panel_route 认 /tasks 前缀）与同一套鉴权。
+            return self._get_tasks_checkin_plan(query)
         if path == "/tasks":
             return self._get_tasks(query)
         if path == "/scheduler":
@@ -19391,6 +19448,64 @@ class Handler(BaseHTTPRequestHandler):
                                since=req_since, until=req_until),
             lambda: perf_stats_etag(sample, realm=req_realm, range=req_range,
                                     since=req_since, until=req_until))
+
+    def _get_tasks_checkin_plan(self, query):
+        """GET /tasks/checkin/plan —— 签到候选快照（§2.3，严格只读）。
+
+        面板要回答的问题是「21:00 这一轮到底会签几个号、剩下的为什么不动」。这里
+        把 wb_scheduler._run_cycle 的候选口径原地复刻一遍并给出 reason，但**不发
+        任何上游请求、不写盘**：签到窗口里刷这个接口不该烧掉一个账号的额度。
+
+        realm 缺省 all（非法值同样按 all 处理）：签到本身只对国内版有意义，但面板
+        要能一眼看到国际版那批为什么一律 not_cn，所以缺省不过滤。
+        """
+        if not self._authorized():
+            return
+        realm = ((query.get("realm") or ["all"])[0] or "all").strip().lower()
+        if realm not in ("all", "cn", "intl"):
+            realm = "all"
+        now = time.time()
+        now_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+        enabled = wb_settings.checkin_enabled(ACCOUNTS_DIR)
+        holds = {r: restriction_hold_remaining(r, now) for r in ("cn", "intl")}
+        rows = []
+        reasons = {}
+        will_attempt = 0
+        for account in (getattr(POOL, "accounts", []) if POOL else []):
+            if realm != "all" and getattr(account, "realm", "") != realm:
+                continue
+            reason = checkin_plan_reason(account, now, enabled, holds)
+            hit = reason == "will_attempt"
+            if hit:
+                will_attempt += 1
+            else:
+                # will_attempt 自己不进 reasons：这一栏是「跳过的理由分布」，
+                # 会签的数量另有 summary.will_attempt 一栏。
+                reasons[reason] = reasons.get(reason, 0) + 1
+            uid = str(getattr(account, "uid", "") or "")
+            rows.append({
+                "uid": uid,
+                "nickname": getattr(account, "nickname", "") or uid[:8],
+                "realm": getattr(account, "realm", ""),
+                "will_attempt": hit,
+                "reason": reason,
+                "lastCheckin": getattr(account, "last_checkin", None),
+            })
+        # 会签的排前面，同组按 uid：面板从上往下看，先看这一轮真的要动的号。
+        rows.sort(key=lambda row: (0 if row["will_attempt"] else 1, row["uid"]))
+        return self._json_panel(200, {
+            "ok": True,
+            "now": now_text,
+            "realm": realm,
+            "summary": {
+                "total": len(rows),
+                "will_attempt": will_attempt,
+                "skipped": len(rows) - will_attempt,
+                "reasons": reasons,
+                "checkin_enabled": enabled,
+            },
+            "accounts": rows,
+        })
 
     def _get_tasks(self, query):
         if not self._authorized():
@@ -20928,6 +21043,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._route_accounts_import_desktop(payload)
         if path == "/accounts/refresh":
             return self._route_accounts_refresh(payload)
+        if path == "/accounts/reload":
+            return self._route_accounts_reload(payload)
         if path == "/accounts/sync-profile":
             return self._route_accounts_sync_profile(payload)
         if path == "/accounts/test":
@@ -21352,6 +21469,46 @@ class Handler(BaseHTTPRequestHandler):
         if new_realm in ("intl", "cn"):
             save_persisted_realm(new_realm)
         return self._json(200, {"ok": True, "current": CURRENT_REALM, "persisted": True})
+
+    def _route_accounts_reload(self, payload):
+        """POST /accounts/reload —— 重读账号目录（P3-2）。
+
+        面板改完 accounts/*.json（或另一个进程写进新账号）之后不用重启：让账号池
+        自己按文件指纹重载，只替换受影响的账号对象，不动端口、不断流 —— 与
+        /hotswap（换 Python 代码）是两条不同的路。
+
+        要面板会话：这是管理动作，拿 API Key 的调用方不该能让池子重载（重载瞬间
+        在途会话与命中率都受影响）。
+        """
+        if not self._panel_ok():
+            return self._error(403, "reloading the account pool requires the "
+                                    "panel session, not an API key",
+                               "invalid_request_error")
+        reloader = getattr(POOL, "reload_if_changed", None) if POOL else None
+        if not callable(reloader):
+            # 老版本账号池（P3-2 未落地）：如实回报「不支持」，不假装重载成功 ——
+            # 面板据此标灰按钮，而不是让人反复点一个什么都不做的接口。
+            return self._json_panel(200, {
+                "ok": True, "changed": False, "unsupported": True,
+                "accounts": len(getattr(POOL, "accounts", []) or []),
+                "accountsView": account_views(),
+            })
+        result = reloader()
+        if not isinstance(result, dict):
+            result = {"changed": bool(result)}
+        changed = bool(result.get("changed"))
+        added = [str(item) for item in (result.get("added") or [])]
+        removed = [str(item) for item in (result.get("removed") or [])]
+        log("accounts  : 重载账号池 changed=%s +%d -%d"
+            % ("yes" if changed else "no", len(added), len(removed)))
+        return self._json_panel(200, {
+            "ok": True,
+            "changed": changed,
+            "added": added,
+            "removed": removed,
+            "accounts": len(getattr(POOL, "accounts", []) or []),
+            "accountsView": account_views(),
+        })
 
     def _route_accounts_checkin(self, payload):
         uid = payload.get("uid")

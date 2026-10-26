@@ -1,3 +1,18 @@
+## 未发布（自用分支）
+
+本批把「任务跑道」从「每整点串行做一遍、做错了没人知道、想暂停只能挨个改账号」改成可观测、可并发、可配置的一条跑道。九个清单项分四组落地，账号级语义与对外接口保持兼容：老的 `settings.json` 一个键都不写也照旧运行，旧的 `/accounts/set`、`/scheduler/toggle`、`/accounts/checkin` 行为不变。
+
+- **P0 后台不再为「什么都不做」付钱**：巡检过去先对全池逐个 `sleep(2~5)` 再判断要不要干活，实测一个空闲整点全流程占 2000 秒（33 分钟，18:08:53→18:42:13，各项计数全 0）。现在候选先算出来、抖动只发生在真要打上游的账号之间，空闲巡检的等待次数为 0（`wb_scheduler.py:631` 起的中文任务批次）。三个「停用但仍在跑任务」的国际版账号已改成不参与任务（生产数据，见回滚）。
+- **P1 签到并批、失败重试、凭证前拦**：签到从逐账号串行改成可并发批次（`tasks_concurrency` 默认 3、上限 8，1 = 回到串行老行为），带总预算 `tasks_budget`（默认 1800 秒，0 = 不限制）与截止时间日志；实测 306 个账号串行 3136 秒、8 路并发 1662 毫秒全成功零 429。瞬态失败（网络异常 / 5xx / 429）按 `checkin_retries`（默认 2）退避重试，上游明确判负的不重打；`can_checkin()` 增加凭证门槛（`wb_accounts.py:2064`），过期号不再每轮白问一次。
+- **P2 状态可查、失败可停、日志可回溯**：新增 `GET /tasks/checkin/plan`（`wb_proxy.py:19452`，与 `GET /tasks` 同一面板门），逐账号给出 `not_cn / api_key / enterprise / tasks_disabled / credential_expired / restricted / region_hold / already_today / checkin_paused / will_attempt` 之一，只读且不落盘；`canCheckin` 序列化改为真实判定（`wb_accounts.py:1321`），面板不再对 309 个国内号恒显「可签到」；`already` 不再覆写 `lastCheckin`（实测 17:08:33 被 19:36:23 覆盖过），`checked` 照旧写；连续认证失败 `auto_disable_auth_failures`（默认 3，0 = 关闭）自动停用并在备注写原因；调度日志落盘 `logs/tasks-YYYYMMDD.log`（`wb_scheduler.py:177`），面板内存环只有 60 条、`/logs` 约 1.5 小时，事后追不了 09:00 那轮。
+- **P3 重启不丢当天的机会**：启动首轮巡检补跑签到（`checkin_startup_catchup` 默认开，判据 `value is not False`——国内签到一天只有 9:00 / 21:00 两个窗口，错过 21:00 就是整天没了），猫猫旅行与连登同样按窗口补；账号目录新增 / 删除 / 外部改写后热加载（`AccountPool.reload_if_changed` `wb_accounts.py:4223`，`POST /accounts/reload` `wb_proxy.py:21473`，本进程自己写盘不算外部变更）；签到状态机落盘 `lastCheckinState / lastCheckinAt / checkinAttempts`（`wb_accounts.py:1212`），`already` 与 `checked` 都算「今天做过了」，跨天自动恢复。
+- **P0-3 一个开关关掉所有国内签到入口**：`wb_settings.checkin_enabled` / `set_checkin_enabled`（`wb_settings.py:2779`），关掉后调度器巡检与面板手动批量都不再签，其余 Token 保活 / 活跃上报 / 猫猫旅行 / 连登 / 夜猫 / 国际活跃一律不受影响；判据同样是 `is not False`，手编坏值只能让签到继续跑，不会悄悄停掉一天。
+- **验收期补的三处**（都在生产实测暴露，随本批一起发）：① `Account.public()` 补 `lastCheckinState / lastCheckinAt / checkinAttempts`（`wb_accounts.py:1319`）——这三个字段之前只进落盘文件，面板拿不到，想看「今天问过上游几次、结果是什么」只能重启；② 巡检汇总行补 `旅行明细 已完成 N/途中 M`（`wb_scheduler.py:621`）——生产实测 187 个 cn 活跃号里只有 3 个发生 depart/claim，其余 184 个是上游 `idle + daily_limit_reached=true`（今日额度已用完），旧格式的「旅行 3」会被读成覆盖数；③ 热加载竞态：`Account.save()` 的「自己写的文件」登记挪进 `_save_lock` 内、紧跟 `os.replace`（`wb_accounts.py:1402`），`reload_if_changed` 判定前再过一遍 `_confirm_external()`（3 次 × 50ms 重取 stat，`wb_accounts.py:4286`）——热切换后第一次 `POST /accounts/reload` 曾返回 `changed=true` 而增删全空，原因是 os.replace 已生效、登记表未更新的窗口里把自家写盘当成了外部改动，整池 Account 重建、`token_expired`/冷却/失败计数清零。
+
+验证：`python tests/run_all.py --jobs 4` → **235 passed, 0 failed, 0 skipped**（74.0 秒，CPython 3.12.13）+ `scripts/check_clean_checkout.py`；新增与改动覆盖 `_test_checkin_batch`（16）、`_test_checkin_persist`（37）、`_test_checkin_plan`（20）、`_test_tasks_settings`（18）、`_test_account_hotreload`（17）、`_test_verify_opt`（61），既有 `_test_schedule_hours`（13，issue #515 的时段门禁）、`_test_daily_chat_*`、`_test_streak_report`、`_test_activity_history`、`_test_keepalive_window` 全部保持通过。
+
+回滚：`git revert` 对应提交；生产回滚 = 还原 `wb_*.py` 的 `.bak-checkin-` 副本后 `scripts/hotswap_update.py` 热切回旧进程；P0-1 的三个国际版账号在 `accounts/*.json` 里把 `tasksEnabled` 改回 `true` 即恢复旧行为（备份在 `backup-20261026-p01/`）。
+
 ## v1.9.0
 
 本版四项改动：前两项针对「面板卡」与「改代码必须停网关」，后两项是面板载荷与服务端压缩；自用分支实现，未向上游提交。套件 229 个（170 Python + 59 JS）。

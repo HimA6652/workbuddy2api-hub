@@ -467,6 +467,35 @@ def checkin_state(code, msg):
     return "failed"
 
 
+#: 连续认证失败自动停用的默认阈值与上限（P2-3）。阈值本身由
+#: wb_settings.auto_disable_auth_failures(accounts_dir) 提供（0 = 关闭）；
+#: 这两个常量只在「设置模块还没有这个开关」或「账号没有 accounts_dir
+#: （单测里手工构造的 Account）」时兜底。默认必须生效：401 重试没有意义，
+#: 让坏凭证继续留在任务队列里只会每轮再撞一次上游。
+AUTO_DISABLE_AUTH_FAILURES_DEFAULT = 3
+AUTO_DISABLE_AUTH_FAILURES_MAX = 20
+
+
+def checkin_attempt_stamp():
+    """签到尝试的本地时刻字符串，写 lastCheckinAt 与 lastCheckin 用。"""
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def checkin_attempts_value(last_checkin_at, attempts, today=None):
+    """今天已累计的签到尝试次数；last_checkin_at 不在今天时一律归零。
+
+    跨天归零靠这一处判定（P3-3）：昨天的失败次数不能算进今天，否则今天的
+    第一次尝试就已经「很失败」，当天次数也不再是当天的事实。
+    """
+    today = today or time.strftime("%Y-%m-%d")
+    if not str(last_checkin_at or "").startswith(today):
+        return 0
+    try:
+        return max(0, int(attempts or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 #: 国际版桌面端的版本号。以前这里硬编码 5.5.2，和 wb_identity 的
 #: DESKTOP_VERSION_INTL 各写一份，改版本时容易只改一处（5.8.4 对齐时
 #: 就漏了这个常量）。现在统一从 wb_identity 取，保持单一来源。
@@ -1021,6 +1050,11 @@ class Account(object):
         self.last_fail_at = 0.0
         # 最近一次软限流（429）的时刻：两条软限流阶梯用同一个时间窗。
         self.last_soft_at = 0.0
+        # 连续认证失败次数（P2-3）：note_error 见到 401 / 认证文案就 +1，成功
+        # 刷新或 token_expired 归零时清零。运行时字段，不落盘——重启后重新数，
+        # 免得一次误判把账号永久关掉。达到 wb_settings.auto_disable_auth_failures
+        # 的阈值（默认 3，0 = 关闭）就自动停用见 _maybe_disable_after_auth_failures。
+        self.auth_fail_streak = 0
         self.credits = data.get("credits") or None
         # 账号档位，来自计费摘要（#505）：{paid, package, package_code,
         # protected_price, trial, checked_at, source}。企业账号不写——上游对
@@ -1037,6 +1071,14 @@ class Account(object):
                         if isinstance(self.credits, dict) else False)
         self.is_paid_user = paid
         self.last_checkin = data.get("lastCheckin") or None
+        # 签到落盘状态（P3-3）：state 是最近一次尝试的分类（checked / already /
+        # pending / failed / 空串），at 是那次尝试的本地时刻，attempts 是**当天**
+        # 累计尝试次数。三者都持久化：网关重启后巡检要知道「今天试过几次、上次
+        # 什么结果」，否则 P2-2 之后 already 不覆写 lastCheckin，当天会被反复重试。
+        self.last_checkin_state = str(data.get("lastCheckinState") or "")
+        self.last_checkin_at = data.get("lastCheckinAt") or None
+        self.checkin_attempts = checkin_attempts_value(self.last_checkin_at,
+                                                       data.get("checkinAttempts"))
         self.last_daily_chat = data.get("lastDailyChat") or None
         # 国内版每天一次的「对话活跃上报」（点亮官方 growth 连登/热力墙）上次
         # 成功的时刻；与 lastCheckin 同款：只按「今天成功过没有」做闸门。
@@ -1165,6 +1207,11 @@ class Account(object):
             # 机器的档位当成结论。
             "tier": self.tier,
             "lastCheckin": self.last_checkin,
+            # 签到落盘状态（P3-3）：state / 时刻 / 当天次数都要落盘。save() 只剥
+            # RUNTIME_ONLY_FIELDS，这三个是持久事实，不进那个名单。
+            "lastCheckinState": self.last_checkin_state,
+            "lastCheckinAt": self.last_checkin_at,
+            "checkinAttempts": int(self.checkin_attempts or 0),
             "lastDailyChat": self.last_daily_chat,
             "lastActivityReport": self.last_activity_report,
             # 持久化：6004 的恢复时间是上游给的事实，重启后仍然成立（见 __init__）。
@@ -1271,9 +1318,17 @@ class Account(object):
                                  if isinstance(self.model_daily_tokens, dict)
                                  else None),
             "lastCheckin": self.last_checkin,
+            # 签到状态机的可见性（P2-1/P3-3）：这三个字段之前只进落盘文件，
+            # 面板拿不到——想看「今天问过几次、结果是什么」只能重启。
+            "lastCheckinState": self.last_checkin_state or None,
+            "lastCheckinAt": self.last_checkin_at,
+            "checkinAttempts": int(self.checkin_attempts or 0),
             "lastDailyChat": self.last_daily_chat,
             "lastActivityReport": self.last_activity_report,
-            "canCheckin": self.realm == "cn" and not self.uses_enterprise_billing(),
+            # 面板的按钮可用性与调度器共用同一道闸门（P2-1）：以前这里单独写
+            # 一遍 realm/企业号判断，签到窗口与按钮会各自漂移。can_checkin()
+            # 现在还含凭证可用性（P1-3）与「今天已经问过上游」的记忆（P2-2）。
+            "canCheckin": self.can_checkin(),
             "canDailyChat": self.realm == "intl",
             "canReportActivity": (self.realm in ("cn", "intl")
                                   and not self.uses_enterprise_billing()),
@@ -1349,6 +1404,19 @@ class Account(object):
                 with open(tmp, "w", encoding="utf-8") as fh:
                     json.dump(payload, fh, ensure_ascii=False, indent=2)
                 os.replace(tmp, path)
+                # 记一笔自己的笔迹（见 _SELF_WRITTEN_FILES）：紧跟 os.replace、
+                # 仍在 _save_lock 里，把「文件已换、登记表还没跟上」的窗口压到最小。
+                # 这个窗口曾经让生产的热重载判出 changed=true 把整池重建了一遍
+                # （20:11:04 实测），外面还有 _confirm_external() 兜底。
+                try:
+                    st = os.stat(path)
+                    _SELF_WRITTEN_FILES[path] = (st.st_mtime_ns, st.st_size)
+                    if len(_SELF_WRITTEN_FILES) > 4096:
+                        # 长跑进程的兜底：账号数有限，这里只保留最近的一半。
+                        for stale in list(_SELF_WRITTEN_FILES)[:2048]:
+                            _SELF_WRITTEN_FILES.pop(stale, None)
+                except OSError:
+                    pass
             except Exception:
                 try:
                     os.unlink(tmp)
@@ -1994,6 +2062,9 @@ class Account(object):
         self.refresh_token = data.get("refreshToken") or self.refresh_token
         self.expires_at = jwt_exp(token) or self.expires_at
         self.token_expired = False
+        # 刷新成功 = 凭证确认可用：连续认证失败计数清零（P2-3），否则一次
+        # 短暂的 401 风暴会攒在计数器里，等下次登录过期时立刻触发自动停用。
+        self.auth_fail_streak = 0
         with self._throttle_lock:
             self.last_error = ""
             self.cooldown_until = 0
@@ -2008,16 +2079,39 @@ class Account(object):
         """
         return bool(self.tasks_enabled)
 
+    def credential_usable(self):
+        """凭证本身还能不能用：有 access_token 且未被判定失效（P1-3）。
+
+        与 ready() 的区别：ready() 还看 enabled / 到期时刻，回答的是「现在能不能
+        派单」；这里只回答「这张凭证是否还值得拿去换一次上游回执」，给签到 / 活跃
+        上报这类**不吃额度**的本地任务用——操作者为了停 API 派单而关掉 enabled
+        时，每日签到不该跟着一起丢。
+        """
+        if not self.access_token:
+            return False
+        return not bool(getattr(self, "token_expired", False))
+
     def can_checkin(self):
         if self.realm != "cn":
             return False
         # 无个人成长体系：企业号上游直接拒，静态 Key 连个人身份都没有。
         if self.uses_enterprise_billing():
             return False
-        if not self.last_checkin:
-            return True
+        # 凭证已失效（401 / 登录过期）时上游只会再回一次 401：不白跑这次请求，
+        # 也不让它污染 fail 统计，等刷新或重新登录之后自然恢复。
+        if not self.credential_usable():
+            return False
         today_str = time.strftime("%Y-%m-%d")
-        return not str(self.last_checkin).startswith(today_str)
+        if self.last_checkin and str(self.last_checkin).startswith(today_str):
+            return False
+        # P2-2 之后 already 不再覆写 lastCheckin（重复回执不该把「签到时刻」往后
+        # 推），lastCheckin 可能停在旧日期。今天其实已经问过上游并拿到 checked /
+        # already 的结论，就不能再问一次——否则每轮巡检都白跑一次上游请求
+        # （187 个账号 × 每轮）。跨天后 lastCheckinAt 不再是今天，自动恢复可签。
+        if self.last_checkin_state in ("checked", "already") \
+                and str(self.last_checkin_at or "").startswith(today_str):
+            return False
+        return True
 
     def can_daily_chat(self):
         if self.realm != "intl":
@@ -2696,8 +2790,38 @@ class Account(object):
         wb_activity.record_attempt(self, wb_activity.TASK_CHECKIN, trigger, res)
         return res
 
+    def _record_checkin_attempt(self, result, state):
+        """把一次签到尝试的结论落盘（P3-3），写盘只在这里发生一次。
+
+        每次尝试都写 lastCheckinAt（本地时刻）与 lastCheckinState（分类）；
+        checkinAttempts 是**当天**的累计次数，跨天自动归零。
+
+        P2-2：checked 总是写 lastCheckin；already 只在 lastCheckin 不是今天时写。
+        上游对「今天已签到」的重复回执每来一次就把时刻改成这一轮的时刻，面板上
+        「今日已领」的时间会一直往后飘，看不出真实签到时刻。
+        """
+        now = checkin_attempt_stamp()
+        today_str = now[:10]
+        if state == "checked" or (state == "already"
+                                 and not str(self.last_checkin or "").startswith(today_str)):
+            self.last_checkin = now
+        self.last_checkin_state = state
+        self.last_checkin_at = now
+        self.checkin_attempts = checkin_attempts_value(
+            self.last_checkin_at, self.checkin_attempts, today_str) + 1
+        # 写盘放在状态判定之后统一做一次：异常分支各自 save 会写多份不一致的
+        # 快照，也不再需要每个出口各抄一遍 exists 判断。
+        if self.path and os.path.exists(os.path.dirname(self.path)):
+            self.save(os.path.dirname(self.path))
+        return result
+
     def _checkin_upstream(self):
-        """签到的实际请求；返回形状见 checkin。"""
+        """签到的实际请求；返回形状见 checkin。
+
+        transient / auth_failed 是给巡检排障用的分类（P3-3）：网络异常、HTTP 5xx、
+        429 记 transient（下一轮值得再试）；HTTP 401 或认证文案记 auth_failed
+        （重试只会再吃一次 401，等刷新或重新登录）。
+        """
         cfg = get_realm_config("cn")
         url = cfg["billing_upstream"] + CHECKIN_PATH
         headers = self.headers(purpose="billing")
@@ -2707,33 +2831,49 @@ class Account(object):
             code = payload.get("code", -1)
             msg = payload.get("msg") or "ok"
             state = checkin_state(code, msg)
+            # 200 里也可能藏着认证失败（上游把 401 包成普通回执返回过）。
+            auth_failed = _auth_failure_text(msg)
             if state in ("checked", "already"):
-                self.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")
-                if self.path and os.path.exists(os.path.dirname(self.path)):
-                    self.save(os.path.dirname(self.path))
-                return {"ok": True, "state": state, "code": code, "msg": msg,
-                        "data": payload.get("data")}
-            return {"ok": False, "state": state, "code": code, "msg": msg, "error": msg}
+                return self._record_checkin_attempt(
+                    {"ok": True, "state": state, "code": code, "msg": msg,
+                     "data": payload.get("data"), "transient": False,
+                     "auth_failed": False}, state)
+            return self._record_checkin_attempt(
+                {"ok": False, "state": state, "code": code, "msg": msg, "error": msg,
+                 "transient": False, "auth_failed": auth_failed}, state)
         except urllib.error.HTTPError as exc:
+            transient = exc.code >= 500 or exc.code == 429
+            auth_failed = exc.code == 401
             try:
                 raw_b = exc.read().decode("utf-8") or "{}"
                 body = json.loads(raw_b)
-                code = body.get("code")
-                msg = body.get("msg") or ("HTTP %d" % exc.code)
-                # 上游如果在今日已签到时返回 HTTP 400 且文案写「今天已签到」，
-                # 说明今日事实上已处于签到完成状态，按成功处理并记录时间。
-                state = checkin_state(code, msg)
-                if state == "already":
-                    self.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")
-                    if self.path and os.path.exists(os.path.dirname(self.path)):
-                        self.save(os.path.dirname(self.path))
-                    return {"ok": True, "state": state, "code": code, "msg": msg,
-                            "data": body.get("data")}
-                return {"ok": False, "state": state, "code": code, "msg": msg, "error": msg}
             except Exception:
-                return {"ok": False, "error": "HTTP %d" % exc.code}
+                body = {}
+            if not isinstance(body, dict):
+                body = {}
+            code = body.get("code")
+            msg = body.get("msg") or ("HTTP %d" % exc.code)
+            state = checkin_state(code, msg)
+            if _auth_failure_text(msg):
+                auth_failed = True
+            if state == "already" and not transient:
+                # 上游在今日已签到时返回 HTTP 400 + 「今天已签到」（实测）：
+                # 事实是今日已完成，按成功处理；时刻由 _record_checkin_attempt
+                # 按 P2-2 的口径决定写不写。
+                return self._record_checkin_attempt(
+                    {"ok": True, "state": state, "code": code, "msg": msg,
+                     "data": body.get("data"), "transient": False,
+                     "auth_failed": auth_failed}, state)
+            return self._record_checkin_attempt(
+                {"ok": False, "state": state, "code": code, "msg": msg, "error": msg,
+                 "transient": transient, "auth_failed": auth_failed}, state)
         except Exception as exc:
-            return {"ok": False, "error": str(exc)}
+            # 网络层（超时 / DNS / TLS / 代理）：没有回执可判，按 transient 记，
+            # 下一轮巡检值得再试。失败也要落一次 lastCheckinAt，好让面板看出
+            # 「今天试过、没拿到回执」而不是一片空白。
+            return self._record_checkin_attempt(
+                {"ok": False, "error": str(exc), "transient": True,
+                 "auth_failed": False}, "failed")
 
     def report_activity(self):
         """国内版对话活跃上报：一条 /v2/report 点亮官方 growth 连登。
@@ -3361,6 +3501,7 @@ class Account(object):
 
     def note_error(self, message, cooldown=60, single_account=False, model=None, until=None,
                    detail=None):
+        auth_hit = False
         with self._throttle_lock:
             self.last_error = str(message)[:200]
             # The visible label keeps its existing truncation; `detail` carries the
@@ -3368,6 +3509,10 @@ class Account(object):
             self.last_error_detail = str(detail)[:2000] if detail else ""
             if _auth_failure_text(message):
                 self.token_expired = True
+                # 连续认证失败计数（P2-3）：401 / 「登录已过期」这类失败重试没有
+                # 意义，累计到阈值就自动停用（见 _maybe_disable_after_auth_failures）。
+                self.auth_fail_streak = int(getattr(self, "auth_fail_streak", 0) or 0) + 1
+                auth_hit = True
             if model:
                 # Model-scoped throttle: keep the account usable for every other model.
                 wait = max(1.0, float(until) - time.time()) if until else (
@@ -3377,9 +3522,60 @@ class Account(object):
                 # 起始时刻：面板要如实说「限流时刻 + 恢复时间」，而恢复时刻减不出
                 # 起始时刻（wait 来自 60s→10m 的阶梯，不落库）。记这一次就够了。
                 self.model_cooldowns_at[model] = now
-                return
-            actual_cooldown = 3 if single_account else cooldown
-            self.cooldown_until = time.time() + actual_cooldown
+            else:
+                actual_cooldown = 3 if single_account else cooldown
+                self.cooldown_until = time.time() + actual_cooldown
+        # 自动停用必须在 _throttle_lock 之外：读阈值要读 wb_settings（有自己的
+        # 锁与磁盘 IO），写盘要拿 _save_lock。两把锁一嵌套就可能互相等死。
+        if auth_hit:
+            self._maybe_disable_after_auth_failures()
+
+    def _auth_disable_threshold(self):
+        """连续认证失败自动停用的阈值；0 = 关闭（P2-3）。
+
+        阈值来自 wb_settings.auto_disable_auth_failures(accounts_dir)。没有
+        accounts_dir（单测里手工构造的账号）或设置模块还没提供这个开关时按内置
+        默认 3 走——坏凭证反复撞 401 是纯粹的空转，默认必须生效。
+        """
+        if not self.accounts_dir:
+            return AUTO_DISABLE_AUTH_FAILURES_DEFAULT
+        getter = getattr(wb_settings, "auto_disable_auth_failures", None)
+        if not callable(getter):
+            return AUTO_DISABLE_AUTH_FAILURES_DEFAULT
+        try:
+            value = int(getter(self.accounts_dir))
+        except Exception:
+            return AUTO_DISABLE_AUTH_FAILURES_DEFAULT
+        return max(0, min(value, AUTO_DISABLE_AUTH_FAILURES_MAX))
+
+    def _maybe_disable_after_auth_failures(self):
+        """连续认证失败达到阈值 → 关掉派单与任务并落盘（P2-3）。
+
+        返回这次是否真的停用了；重复命中不再重复写盘（账号已经是停用状态时
+        直接返回 False），免得每来一次 401 就多写一次文件。
+        """
+        threshold = self._auth_disable_threshold()
+        if threshold <= 0:
+            return False
+        with self._throttle_lock:
+            streak = int(getattr(self, "auth_fail_streak", 0) or 0)
+            if streak < threshold:
+                return False
+            if not self.enabled and not self.tasks_enabled:
+                return False
+            self.enabled = False
+            self.tasks_enabled = False
+            note = "连续 %d 次认证失败，已自动停用（%s）" % (streak, checkin_attempt_stamp())
+            # 备注留最近的内容：操作者最需要看到的是「为什么被关了」，旧备注
+            # 超长时截掉头部，而不是把这条解释删掉。
+            self.note = (("%s %s" % (self.note, note)).strip() if self.note else note)[-200:]
+        # 与 _throttle_lock 分开：save() 自己取 _save_lock，两把锁不嵌套。
+        if self.path and os.path.exists(os.path.dirname(self.path)):
+            try:
+                self.save(os.path.dirname(self.path))
+            except Exception:
+                pass
+        return True
 
     def note_restricted(self, detail="", cooldown=None):
         """上游账号级风控限制（403 / code 11140）：按小时冷却，且不随重启消失。
@@ -3554,6 +3750,9 @@ class Account(object):
             self.last_error_detail = ""
             self.cooldown_until = 0.0
             self.token_expired = False
+            # token_expired 归零 = 凭证已被上游真实答复证明可用，连续认证失败
+            # 计数一起清零（P2-3）。
+            self.auth_fail_streak = 0
 
     def throttle_wait(self, model=None):
         """Seconds until this account can serve `model` again (0 = right now)."""
@@ -3940,15 +4139,21 @@ class CreditsRefresher(threading.Thread):
 
 # 和账号凭证放在同一个目录、但本身不是账号的文件。跳过它们，免得每次启动
 # 都被当成「损坏的账号」解析并打一条 error 日志（settings.json 是面板设置，
-# active_realm.json 是区域开关）。
-NON_ACCOUNT_FILES = ("settings.json", "active_realm.json")
-
-
-# 和账号凭证放在同一个目录、但本身不是账号的文件。跳过它们，免得每次启动
-# 都被当成「损坏的账号」解析并打一条 error 日志（settings.json 是面板设置，
 # active_realm.json 是区域开关，model_windows.json 是额度窗口记录，
-# quota_scan.json 是主动额度查询记录）。
-NON_ACCOUNT_FILES = ("settings.json", "active_realm.json", "model_windows.json", "quota_scan.json")
+# quota_scan.json 是主动额度查询记录，model.json 是 models.dev 的索引缓存——
+# 缓存一刷新（wb_modelsdev.save_index）就会改 mtime，漏掉它等于每写一次缓存
+# 就判一次「目录被外部改动」，把整池运行态（冷却 / 熔断 / 签到状态机）重建一遍）。
+NON_ACCOUNT_FILES = ("settings.json", "active_realm.json", "model_windows.json",
+                     "quota_scan.json", "model.json")
+
+
+# 本进程自己写下去的凭证文件：绝对路径 -> 写完之后的 (mtime_ns, size)。
+# 签到 / 刷新 token / 自动停用都会 save() 一次，文件 mtime 必然变；不认出这是
+# 自己的笔迹，reload_if_changed() 每轮都会判「目录已变化」→ load() 重建账号，
+# 把运行态（model_cooldowns、cooldown_until、熔断、auth_fail_streak）全部清掉，
+# P2-3 的「连续 3 次认证失败自动停用」就永远攒不满。这里只用于「这个变化是不是
+# 我自己刚写的」判定，磁盘内容仍是唯一权威。
+_SELF_WRITTEN_FILES = {}
 
 
 class AccountPool(object):
@@ -3979,6 +4184,13 @@ class AccountPool(object):
         # uid 排序表的缓存：池成员没变就直接复用，变了重建（见 _page_ranks）。
         self._page_order_cache = None
         self.affinity = SessionAffinity()
+        # 账号目录的最近一次签名 (json 文件数, 最大 mtime_ns, 总字节数)：
+        # reload_if_changed() 用它判断要不要重载（P3-2）。None = 还没看过目录，
+        # 首次调用只记录签名、不重载。
+        self._fs_signature = None
+        # 逐文件 stat 快照（文件名 -> (mtime_ns, size)）：聚合签名变了之后还要分清
+        # 「别人改了」和「本进程自己 save() 写的」，逐个文件比对才做得到。
+        self._file_stats = {}
 
     def load(self):
         with self._lock:
@@ -4006,6 +4218,146 @@ class AccountPool(object):
             # 探针可见：池子照常派单（每单再吃一次 429），面板「当前禁用」也空着。
             self.restore_window_cooldowns()
             return self.accounts
+
+    def _file_stat_map(self):
+        """账号目录里每个账号文件的 (mtime_ns, size)，键是文件名。
+
+        与 _dir_signature() 同一口径（只 stat、不解析），但按文件分开留一份：
+        聚合签名只说明「有东西变了」，分不清是别人改的还是本进程 save() 写的。
+        跳过 NON_ACCOUNT_FILES——settings.json 这类文件变了不该触发账号重载。
+        """
+        stats = {}
+        try:
+            names = os.listdir(self.dir)
+        except OSError:
+            return stats
+        for name in names:
+            if not name.endswith(".json") or name in NON_ACCOUNT_FILES:
+                continue
+            try:
+                st = os.stat(os.path.join(self.dir, name))
+            except OSError:
+                continue
+            stats[name] = (st.st_mtime_ns, st.st_size)
+        return stats
+
+    @staticmethod
+    def _signature_from(stats):
+        """把逐文件 stat 折成规范要求的签名：(json 文件数, 最大 mtime_ns, 总字节数)。"""
+        newest = 0
+        total = 0
+        for mtime_ns, size in stats.values():
+            if mtime_ns > newest:
+                newest = mtime_ns
+            total += size
+        return (len(stats), newest, total)
+
+    def _dir_signature(self):
+        """账号目录的轻量签名：(json 文件数, 最大 mtime_ns, 总字节数)。
+
+        比逐个文件解析便宜得多，也足够发现「加了 / 删了 / 改了」：mtime 用纳秒，
+        同一秒内的两次写入也区分得开；总字节数兜住「mtime 被工具改回原值」
+        这种少见情况。
+        """
+        return self._signature_from(self._file_stat_map())
+
+    def _is_external(self, name, stats):
+        """单个文件的变化是否来自本进程之外（新增 / 删除 / 内容变了）。
+
+        判定口径：上一轮没见过的文件名算新增；stat 既不是上一轮记住的值、也不是
+        本进程 save() 之后登记的值（_SELF_WRITTEN_FILES）就算外部改动。自己写下去
+        的那些内容就在内存里，重载只会白白清掉运行态，所以要逐文件比对。
+        """
+        stat = stats.get(name)
+        if stat is None:
+            # 上一轮还见过、这一轮没了：确实被删了（Account.delete / 面板删除）。
+            return name in self._file_stats
+        if self._file_stats.get(name) == stat:
+            return False
+        path = os.path.abspath(os.path.join(self.dir, name))
+        return _SELF_WRITTEN_FILES.get(path) != stat
+
+    def _external_changes(self, stats):
+        """聚合签名变了之后，挑出初判为「外部改动」的文件名集合。"""
+        changed = set()
+        for name in set(stats) | set(self._file_stats):
+            if self._is_external(name, stats):
+                changed.add(name)
+        return changed
+
+    def _confirm_external(self, names, attempts=3, delay=0.05):
+        """复核初判的外部件变化，洗掉「自己刚写完、登记表还没跟上」的假阳性。
+
+        Account.save() 里 os.replace 生效的那一刻文件 mtime 就变了，而
+        _SELF_WRITTEN_FILES 的登记要晚几微秒。启动补跑那一轮 187 个账号在持续
+        写盘（活跃上报 / 旅行 / 刷新 token），面板或调度器的 reload 正好切进这个
+        窗口，就会把「自己的笔迹」当成外部改动，整池 load() 一遍——生产
+        20:11:04 的热切换就是这么判出 changed=true 的。
+
+        这里隔 delay 秒重取一次 stat 再判：只要登记表已经跟上就洗白。真外部改动
+        才会多等这 50～100 毫秒（一轮巡检一次、面板手动一次，代价可忽略）。
+        """
+        pending = set(names)
+        for attempt in range(max(1, int(attempts))):
+            if not pending:
+                return set()
+            if attempt:
+                time.sleep(delay)
+            stats = self._file_stat_map()
+            pending = {name for name in pending if self._is_external(name, stats)}
+        return pending
+
+    def reload_if_changed(self):
+        """目录没变就不动；变了就重载并给出 uid 增删（P3-2）。
+
+        调度器每轮开头调一次：面板或别的进程往目录里写账号时不用重启网关，
+        也不会因为每轮无脑 load() 把运行态（token_expired、冷却、熔断）全清掉。
+
+        返回 {"changed": bool, "checked": 账号数, "added": [uid], "removed": [uid]}。
+        首次调用只记录签名、不重载——池子刚构造完，要不要 load() 是调用方的决定。
+
+        本进程 save() 自己写出来的 mtime/size 变化不算「目录变了」（见
+        _SELF_WRITTEN_FILES）：签到每轮都落盘，认不出自己的笔迹就会变成「每轮
+        重载一次」，冷却、熔断、auth_fail_streak 跟着被清空。登记表本身有
+        微秒级的滞后窗口，初判为外部的文件还要过一遍 _confirm_external() 复核。
+        """
+        stats = self._file_stat_map()
+        signature = self._signature_from(stats)
+        previous = self._fs_signature
+        if previous is None or previous == signature:
+            # 首次：只记签名；签名没变：连 load() 都不进。
+            self._fs_signature = signature
+            self._file_stats = stats
+            with self._lock:
+                checked = len(self.accounts)
+            return {"changed": False, "checked": checked, "added": [], "removed": []}
+        if not self._confirm_external(self._external_changes(stats)):
+            # 变了，但全是本进程自己 save() 写下去的（签到落盘、刷新 token、自动停用
+            # 都算）：磁盘内容就是内存里这一份，重载只会把冷却 / 熔断 / 认证失败计数
+            # 清掉，还得每轮打一条「账号目录已变化」。签名跟上即可。
+            # 复核期间可能又有新写入，签名按最新的一次 stat 重新取。
+            self._file_stats = self._file_stat_map()
+            self._fs_signature = self._signature_from(self._file_stats)
+            with self._lock:
+                checked = len(self.accounts)
+            return {"changed": False, "checked": checked, "added": [], "removed": []}
+        with self._lock:
+            before = {account.uid for account in self.accounts}
+        # load() 会重建 Account 对象，运行态（token_expired / 冷却 / 熔断）
+        # 随之重置。这正是「文件变了」时想要的语义：磁盘是权威，面板刚写下去
+        # 的 enabled / note / 新 token 立即生效。
+        self.load()
+        with self._lock:
+            after = {account.uid for account in self.accounts}
+        added = sorted(after - before)
+        removed = sorted(before - after)
+        # 重载之后再取一次签名：load() 期间又有写入也能算进去，不会下一轮白重载。
+        self._file_stats = self._file_stat_map()
+        self._fs_signature = self._signature_from(self._file_stats)
+        self.log("账号目录已变化：现有 %d 个账号（新增 %s，移除 %s）"
+                 % (len(after), ", ".join(added) or "无", ", ".join(removed) or "无"))
+        return {"changed": True, "checked": len(after), "added": added,
+                "removed": removed}
 
     def restore_model_caps(self, now=None):
         """把仍在恢复时间内的 6004 挂回每个账号的模型冷却上。"""
@@ -5144,7 +5496,10 @@ EXPORT_VERSION = 1
 # exported for inspection but never trusted on import: a stale cooldown or a
 # disabled flag from another machine would silently cripple the target pool.
 VOLATILE_FIELDS = ("cooldownUntil", "lastError", "credits", "lastCheckin",
-                   "lastDailyChat", "lastActivityReport", "modelCaps", "tier")
+                   "lastDailyChat", "lastActivityReport", "modelCaps", "tier",
+                   # 签到落盘状态（P3-3）同样描述本机事实：换一台机器导入时
+                   # 「今天已经签到过」不成立，次数也不该跟着搬过去。
+                   "lastCheckinState", "lastCheckinAt", "checkinAttempts")
 
 # The subset of VOLATILE_FIELDS that must not round-trip through the local
 # credential file at all: they are not trusted on load and not written by save(),

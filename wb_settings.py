@@ -2581,6 +2581,230 @@ def set_daily_chat_web_fallback_activity(accounts_dir, enabled):
     return enabled
 
 
+# ---------------------------------------------------------------- 任务跑道配置（P0–P3）
+# 签到层优化的这一组旋钮和 daily_chat_* 那组同理：它们共同决定「一次巡检最多占住
+# 调度器多久、每个账号最多花掉几次上游请求」，所以成组存放、成组校验。
+#
+#   * tasks_concurrency          —— 中文任务跑道同时跑几个账号（1 = 旧串行）
+#   * tasks_budget               —— 整条中文任务跑道的时间上限（秒），0 = 不限制
+#   * checkin_retries            —— 瞬态失败的重试次数（不含首次），0 = 不重试
+#   * checkin_startup_catchup    —— 重启后是否补跑今天错过的签到时段
+#   * auto_disable_auth_failures —— 连续认证失败几次自动停用，0 = 不启用
+#   * checkin_enabled            —— 国内签到的总闸（P0-3）
+#
+# 读写口径照抄 daily_chat_budget / daily_chat_web_concurrency：写入非法直接
+# ValueError（面板手填要立刻看见错误），读到非法回落默认（手编 settings.json 不该
+# 把巡检变成对上游的突刺）。bool 是 int 的子类，所以每个范围校验都先排除 bool，
+# 否则 JSON 里的 true 会被当成 1 混过去。
+TASKS_CONCURRENCY_DEFAULT = 3
+TASKS_CONCURRENCY_MAX = 8
+TASKS_CONCURRENCY_KEY = "tasks_concurrency"
+#: 整条中文任务跑道（签到 / 活跃上报 / 猫猫旅行 / 连登 / 夜猫）的时间上限（秒）。
+#: 0 = 不限制（回到旧行为）；7200 = 两小时，已经远超一个整点批处理窗口。
+TASKS_BUDGET_DEFAULT = 1800
+TASKS_BUDGET_MAX = 7200
+TASKS_BUDGET_KEY = "tasks_budget"
+#: 瞬态失败（网络异常 / HTTP 5xx / 429）重试几次，不含首次。
+CHECKIN_RETRIES_DEFAULT = 2
+CHECKIN_RETRIES_MAX = 5
+CHECKIN_RETRIES_KEY = "checkin_retries"
+CHECKIN_STARTUP_CATCHUP_KEY = "checkin_startup_catchup"
+#: 连续认证失败几次自动停用该账号；0 = 关闭自动停用。
+AUTO_DISABLE_AUTH_DEFAULT = 3
+AUTO_DISABLE_AUTH_MAX = 10
+AUTO_DISABLE_AUTH_KEY = "auto_disable_auth_failures"
+CHECKIN_ENABLED_KEY = "checkin_enabled"
+
+
+def _default_accounts_dir():
+    """没显式传账号目录时的落点，与 wb_proxy.ACCOUNTS_DIR 同一口径。
+
+    只给 checkin_enabled 这种「调用方可能不关心落点」的读取用；其余 getter 仍然
+    要求调用方给目录，免得在错误的目录上读写设置。
+    """
+    return (os.environ.get("ACCOUNTS_DIR")
+            or os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts"))
+
+
+def tasks_concurrency(accounts_dir, default=None):
+    """中文任务跑道同时跑几个账号。
+
+    ``default`` 是没配置时的取值（3），调用方带自己的内置默认就保留它。越界或
+    非整数一律回落：手编 settings.json 写个 100 不该变成一轮对上游的突刺。1 表示
+    回到旧的逐账号串行 + 2~5 秒抖动。
+    """
+    if default is None:
+        default = TASKS_CONCURRENCY_DEFAULT
+    value = load(accounts_dir).get(TASKS_CONCURRENCY_KEY)
+    if (isinstance(value, bool) or not isinstance(value, int)
+            or value < 1 or value > TASKS_CONCURRENCY_MAX):
+        return default
+    return value
+
+
+def set_tasks_concurrency(accounts_dir, value):
+    """Persist the task-runway concurrency. Returns the stored whole number."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("tasks_concurrency must be a whole number")
+    if value < 1:
+        raise ValueError("tasks_concurrency cannot be less than 1")
+    if value > TASKS_CONCURRENCY_MAX:
+        raise ValueError("tasks_concurrency cannot be more than %d"
+                         % TASKS_CONCURRENCY_MAX)
+    with _lock:
+        data = load(accounts_dir)
+        data[TASKS_CONCURRENCY_KEY] = value
+        save(accounts_dir, data)
+    return value
+
+
+def tasks_budget(accounts_dir, default=None):
+    """整条中文任务跑道的时间上限（秒）；0 = 不限制。
+
+    ``default`` 是没配置时的取值（1800 秒）。批次 deadline 从它推出，所以
+    这个数就是「一轮巡检最长占住调度器多久」的上界。
+    """
+    if default is None:
+        default = TASKS_BUDGET_DEFAULT
+    value = load(accounts_dir).get(TASKS_BUDGET_KEY)
+    if (isinstance(value, bool) or not isinstance(value, int)
+            or value < 0 or value > TASKS_BUDGET_MAX):
+        return default
+    return value
+
+
+def set_tasks_budget(accounts_dir, seconds):
+    """Persist the task-runway budget. Returns the stored whole number."""
+    if isinstance(seconds, bool) or not isinstance(seconds, int):
+        raise ValueError("tasks_budget must be a whole number")
+    if seconds < 0:
+        raise ValueError("tasks_budget cannot be negative")
+    if seconds > TASKS_BUDGET_MAX:
+        raise ValueError("tasks_budget cannot be more than %d"
+                         % TASKS_BUDGET_MAX)
+    with _lock:
+        data = load(accounts_dir)
+        data[TASKS_BUDGET_KEY] = seconds
+        save(accounts_dir, data)
+    return seconds
+
+
+def checkin_retries(accounts_dir, default=None):
+    """瞬态失败的重试次数（不含首次）；0 = 只打一次。
+
+    ``default`` 是没配置时的取值（2）。只对「值得重试」的失败生效：网络异常 /
+    HTTP 5xx / 429 这类，上游明确说失败（文案判负）的不重打。
+    """
+    if default is None:
+        default = CHECKIN_RETRIES_DEFAULT
+    value = load(accounts_dir).get(CHECKIN_RETRIES_KEY)
+    if (isinstance(value, bool) or not isinstance(value, int)
+            or value < 0 or value > CHECKIN_RETRIES_MAX):
+        return default
+    return value
+
+
+def set_checkin_retries(accounts_dir, value):
+    """Persist the check-in retry count. Returns the stored whole number."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("checkin_retries must be a whole number")
+    if value < 0:
+        raise ValueError("checkin_retries cannot be negative")
+    if value > CHECKIN_RETRIES_MAX:
+        raise ValueError("checkin_retries cannot be more than %d"
+                         % CHECKIN_RETRIES_MAX)
+    with _lock:
+        data = load(accounts_dir)
+        data[CHECKIN_RETRIES_KEY] = value
+        save(accounts_dir, data)
+    return value
+
+
+def checkin_startup_catchup(accounts_dir):
+    """重启后是否补跑今天错过的签到时段。默认开启。
+
+    与 daily_chat_startup_catchup 同一个理由：进程在时段里停过（或调度线程被卡
+    住），旧实现只能等下一个时段 —— 国内签到一天只有 9:00 / 21:00 两次，错过
+    21:00 就是整整一天没了。判据是 `is not False`：只有存着明确的 JSON false 才算
+    关，手编的 "false" / 0 / 对象 / 缺失一律按开启处理 —— 「补跑」这件事坏值只能
+    多跑一次，不能把当天的机会悄悄丢掉（daily_chat_startup_catchup 用的是
+    `is True`，那边坏值等于关闭只损失一次打卡，这里损失的是整天的签到）。
+    """
+    value = load(accounts_dir).get(CHECKIN_STARTUP_CATCHUP_KEY)
+    return value is not False
+
+
+def set_checkin_startup_catchup(accounts_dir, enabled):
+    """Persist the check-in startup catch-up switch. Returns the boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data[CHECKIN_STARTUP_CATCHUP_KEY] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
+def auto_disable_auth_failures(accounts_dir, default=None):
+    """连续认证失败几次就自动停用账号；0 = 关闭自动停用，默认 3。
+
+    停用口径（enabled / tasks_enabled 一起关）由 wb_accounts.note_error 执行，
+    这里只负责存阈值。坏值回落默认：读成 0 会把自动停用悄悄关掉，读成很大的数
+    等于永远不停用，两种都比「按默认 3 次」更危险。
+    """
+    if default is None:
+        default = AUTO_DISABLE_AUTH_DEFAULT
+    value = load(accounts_dir).get(AUTO_DISABLE_AUTH_KEY)
+    if (isinstance(value, bool) or not isinstance(value, int)
+            or value < 0 or value > AUTO_DISABLE_AUTH_MAX):
+        return default
+    return value
+
+
+def set_auto_disable_auth_failures(accounts_dir, value):
+    """Persist the auth-failure threshold. Returns the stored whole number."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("auto_disable_auth_failures must be a whole number")
+    if value < 0:
+        raise ValueError("auto_disable_auth_failures cannot be negative")
+    if value > AUTO_DISABLE_AUTH_MAX:
+        raise ValueError("auto_disable_auth_failures cannot be more than %d"
+                         % AUTO_DISABLE_AUTH_MAX)
+    with _lock:
+        data = load(accounts_dir)
+        data[AUTO_DISABLE_AUTH_KEY] = value
+        save(accounts_dir, data)
+    return value
+
+
+def checkin_enabled(accounts_dir=None):
+    """国内签到的总闸（P0-3），默认开启。
+
+    与 schedule_hours 里的签到时段不是一回事：改时段只是「今天不排」，账号级的
+    can_checkin() 与面板的「立即签到」按钮照旧能打上游。这个开关关掉的是**所有**
+    国内签到入口（调度器巡检与面板手动批量），其它任务 —— Token 保活 / 活跃上报 /
+    猫猫旅行 / 连登 / 夜猫 / 国际版活跃 —— 一律不受影响。
+
+    ``accounts_dir`` 可以省略：省略时用与 wb_proxy 一致的默认账号目录，调用方
+    在只读路径上（比如 /tasks/checkin/plan）不必先拿到目录。判据是 `is not False`：
+    只有存着明确的 JSON false 才算关，手编的 "false" / 0 / 对象 / 缺失一律按开启
+    处理 —— 这个开关是签到总闸，坏值只能让签到继续跑，绝不能悄悄停掉一整天的签到。
+    """
+    if not accounts_dir:
+        accounts_dir = _default_accounts_dir()
+    value = load(accounts_dir).get(CHECKIN_ENABLED_KEY)
+    return value is not False
+
+
+def set_checkin_enabled(accounts_dir, enabled):
+    """Persist the check-in master switch. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data[CHECKIN_ENABLED_KEY] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
 def local_web_tools(accounts_dir):
     """Whether the gateway runs web_search / web_fetch calls itself.
 
