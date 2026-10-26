@@ -119,7 +119,7 @@ const posts = () => calls.filter(c => c.method === 'POST');
     current_version: '1.6.17', latest_version: '1.6.18', update_available: true,
     enabled: true, checking: false,
     last_attempt: '2026-10-09 12:00:00', last_success: '2026-10-09 12:00:00',
-    last_error: '', release_url: 'https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases/tag/v1.6.18',
+    last_error: '', release_url: 'https://github.com/HimA6652/workbuddy2api-hub/releases/tag/v1.6.18',
     latest_tag: 'v1.6.18', install_enabled: true,
     installation: {state: 'idle', version: '', message: ''},
     published_at: '2026-10-09T00:00:00Z',
@@ -246,7 +246,7 @@ const posts = () => calls.filter(c => c.method === 'POST');
   const installBtn = element('setUpdateInstallBtn');
   updatesPayload = {
     current_version: '1.6.17', latest_version: '1.6.18', update_available: true,
-    latest_tag: 'v1.6.18', release_url: 'https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases/tag/v1.6.18',
+    latest_tag: 'v1.6.18', release_url: 'https://github.com/HimA6652/workbuddy2api-hub/releases/tag/v1.6.18',
     install_enabled: true, last_error: '', installation: {state: 'idle'},
   };
   api.applyUpdateStatus(updatesPayload);
@@ -264,7 +264,7 @@ const posts = () => calls.filter(c => c.method === 'POST');
   check('没有新版本时安装按钮禁用', installBtn.disabled === true);
   updatesPayload = {
     current_version: '1.6.17', latest_version: '1.6.18', update_available: true,
-    latest_tag: 'v1.6.18', release_url: 'https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases/tag/v1.6.18',
+    latest_tag: 'v1.6.18', release_url: 'https://github.com/HimA6652/workbuddy2api-hub/releases/tag/v1.6.18',
     install_enabled: true, last_error: '', installation: {state: 'idle'},
   };
   api.applyUpdateStatus(updatesPayload);

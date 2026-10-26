@@ -186,10 +186,21 @@ class BacklogTests(unittest.TestCase):
         """
         with open(os.path.join(ROOT, "wb_proxy.py"), encoding="utf-8") as fh:
             src = fh.read()
-        self.assertIn("server = GatewayServer((args.host, args.port), Handler)",
+        # 监听由 _build_server 统一建：热切换要接管上一个进程交过来的 socket，
+        # 那条路径也得穿过同一个 GatewayServer（backlog 挂在类上，不因入口而变）。
+        self.assertIn("return GatewayServer((args.host, args.port), Handler)",
                       src,
-                      "_serve_forever no longer starts GatewayServer, so the "
+                      "_build_server no longer starts GatewayServer, so the "
                       "backlog fix is not on the serving path")
+        self.assertIn("bind_and_activate=False", src,
+                      "the socket-takeover branch must reuse the inherited "
+                      "listening socket instead of binding a fresh one")
+        self.assertIn("server = _build_server(args)", src,
+                      "_serve_forever no longer goes through _build_server, so "
+                      "nothing guarantees the serving path builds GatewayServer")
+        self.assertEqual(src.count("GatewayServer((args.host, args.port), Handler)"), 1,
+                         "the fresh-bind branch must stay the single place that "
+                         "constructs the listener")
 
 
 class PayloadCapTests(unittest.TestCase):

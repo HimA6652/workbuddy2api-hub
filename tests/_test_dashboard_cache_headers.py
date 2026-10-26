@@ -20,6 +20,7 @@ HTTP 处理器里，只有真发请求才看得见；而校验语言切换、mti
 
     python tests/_test_dashboard_cache_headers.py
 """
+import gzip
 import http.client
 import json
 import os
@@ -233,6 +234,38 @@ try:
           status)
     status, _, _ = get("/", {"If-Modified-Since": "not a date at all"})
     check("畸形 IMS 也 200 且不崩", status == 200, status)
+
+    print("[11] 首屏 HTML 开启 gzip：同一份字节的两种表示，各有自己的校验符")
+    status, headers, gz_body = get("/", {"Accept-Encoding": "gzip"})
+    check("200", status == 200, status)
+    check("Content-Encoding: gzip",
+          (headers.get("Content-Encoding") or "").strip() == "gzip",
+          headers.get("Content-Encoding"))
+    check("Vary 声明了 Accept-Encoding",
+          "accept-encoding" in (headers.get("Vary") or "").lower(),
+          headers.get("Vary"))
+    check("Content-Length = 压缩后字节数",
+          headers.get("Content-Length") == str(len(gz_body)),
+          "%s vs %d" % (headers.get("Content-Length"), len(gz_body)))
+    identity_bytes = rendered(disk2, "en")
+    check("压缩后不到原页一半", len(gz_body) * 2 < len(identity_bytes),
+          "%d vs %d bytes" % (len(gz_body), len(identity_bytes)))
+    check("解压后与页面对应字节逐字节一致",
+          gzip.decompress(gz_body) == identity_bytes)
+    etag_gz = headers.get("ETag") or ""
+    check("gzip 表示有独立的校验符", etag_gz and etag_gz != etag3,
+          "%s vs %s" % (etag3, etag_gz))
+    status, headers, body = get("/", {"Accept-Encoding": "gzip",
+                                      "If-None-Match": etag_gz})
+    check("gzip 变体的 tag 命中 304", status == 304, status)
+    check("304 仍声明 Vary",
+          "accept-encoding" in (headers.get("Vary") or "").lower(),
+          headers.get("Vary"))
+    status, _, body = get("/", {"Accept-Encoding": "gzip", "If-None-Match": etag3})
+    check("identity 的 tag 不能命中 gzip 变体（否则回错表示）",
+          status == 200, status)
+    status, headers, _ = get("/", {"If-None-Match": etag3})
+    check("不带 Accept-Encoding 的请求仍按 identity 校验为 304", status == 304, status)
 
     print("[10] dashboard.html 缺失：保持原有的 500 行为")
     os.remove(dash_path)

@@ -45,7 +45,7 @@ def release(tag, **overrides):
         "tag_name": tag,
         "draft": False,
         "prerelease": False,
-        "html_url": "https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases/tag/" + tag,
+        "html_url": "https://github.com/HimA6652/workbuddy2api-hub/releases/tag/" + tag,
         "published_at": "2026-10-08T00:00:00Z",
     }
     entry.update(overrides)
@@ -70,7 +70,7 @@ class FakeFetcher(object):
 
 
 def tag_url(tag):
-    return ("https://github.com/ardeyouxipianyi/workbuddy2api-hub"
+    return ("https://github.com/HimA6652/workbuddy2api-hub"
             "/releases/tag/" + tag)
 
 

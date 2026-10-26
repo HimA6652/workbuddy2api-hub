@@ -19,6 +19,7 @@ import base64
 import bisect
 import calendar
 import errno
+import gzip
 import hashlib
 import heapq
 import http.client
@@ -60,7 +61,9 @@ except ValueError:
     MAX_CONCURRENT_CHAT = CHAT_SLOTS_FLOOR
 CHAT_SLOT_WAIT_SECONDS = float(os.environ.get("WB_CHAT_SLOT_WAIT", 30))
 import socket
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -5973,12 +5976,13 @@ def _credits_sweep_end():
         _CREDITS_SWEEP_RUNNING = False
 
 
-def _credits_sweep(targets, paced=True):
+def _credits_sweep(targets, paced=True, progress=None):
     """串行刷一批账号的积分，账号之间按拟人间隔停一下。
 
     targets 里的 None（uid 查不到）跳过；单个账号取数**抛异常**也只记下来，
     不中断整轮（池里一个坏凭证不该让其余账号全部刷不到）。
     paced=False（单账号）时一步不停，保持改造前的即时反应。
+    progress 给定时（后台全池刷）每刷完一个就 +1，轮询方据此画进度。
     """
     lo, hi = _credits_sweep_gap_seconds() if paced else (0.0, 0.0)
     results = []
@@ -5998,7 +6002,80 @@ def _credits_sweep(targets, paced=True):
             res = {"ok": False, "error": str(exc)}
         results.append({"uid": account.uid, "ok": res.get("ok", False),
                         "credits": account.credits, "error": res.get("error", "")})
+        if progress is not None:
+            progress["done"] = int(progress.get("done") or 0) + 1
     return results
+
+
+# ---- 全池刷积分：进度回执 + 后台执行 ----
+# 面板「一键刷新积分」原本是同步的：数百个账号 × 0.8~1.2s 拟人间隔 ≈ 6~10 分钟，
+# 这条 HTTP 请求全程挂着，浏览器那头就是个转圈到天荒地老的按钮。现在后台线程跑、
+# 立刻回执，进度由 GET /accounts/credits/status 提供。
+_CREDITS_PROGRESS = {"running": False, "total": 0, "done": 0,
+                     "started": 0.0, "finished": 0.0, "error": ""}
+_CREDITS_PROGRESS_LOCK = threading.Lock()
+
+
+def _credits_progress_open(total):
+    """开一轮：计数归零。调用方必须已经拿到单飞（_credits_sweep_begin）。"""
+    with _CREDITS_PROGRESS_LOCK:
+        _CREDITS_PROGRESS.update({"running": True, "total": int(total or 0), "done": 0,
+                                  "started": time.time(), "finished": 0.0, "error": ""})
+
+
+def _credits_progress_close(error=""):
+    with _CREDITS_PROGRESS_LOCK:
+        _CREDITS_PROGRESS["running"] = False
+        _CREDITS_PROGRESS["finished"] = time.time()
+        if error:
+            _CREDITS_PROGRESS["error"] = str(error)
+
+
+def _credits_progress_view():
+    """给前端的进度回执：busy、total、done、percent（外加起止时刻与错误）。"""
+    with _CREDITS_PROGRESS_LOCK:
+        snap = dict(_CREDITS_PROGRESS)
+    total = int(snap.get("total") or 0)
+    done = int(snap.get("done") or 0)
+    snap["busy"] = bool(snap.get("running"))
+    snap["percent"] = (100 * done // total) if total else (0 if snap["busy"] else 100)
+    return snap
+
+
+def _credits_sweep_async(targets):
+    """后台跑一轮全池刷积分，立刻返回回执（不占用 HTTP 线程）。
+
+    返回 {"started", "busy", "total", "done"}。busy=True 表示已有一轮在跑，
+    这次什么都没做 —— 调用方照样拿得到当前快照，也照样能轮询进度。
+    """
+    pending = [a for a in targets if a is not None]
+    total = len(pending)
+    if not _credits_sweep_begin():
+        view = _credits_progress_view()
+        return {"started": False, "busy": True,
+                "total": int(view.get("total") or 0), "done": int(view.get("done") or 0)}
+    _credits_progress_open(total)
+
+    def _run():
+        error = ""
+        try:
+            _credits_sweep(pending, paced=total > 1, progress=_CREDITS_PROGRESS)
+        except Exception as exc:
+            error = str(exc)
+            log("credits sweep (background) failed: %s" % exc, level="WARN")
+        finally:
+            _credits_sweep_end()
+            _credits_progress_close(error)
+
+    try:
+        threading.Thread(target=_run, name="credits-sweep", daemon=True).start()
+    except Exception as exc:
+        # 线程起不来必须把单飞放掉，否则此后面板永远看到 busy。
+        _credits_sweep_end()
+        _credits_progress_close(str(exc))
+        log("credits sweep (background) could not start: %s" % exc, level="WARN")
+        return {"started": False, "busy": False, "total": total, "done": 0}
+    return {"started": True, "busy": False, "total": total, "done": 0}
 
 # Release discovery only - the checker never downloads or installs anything.
 UPDATES = None
@@ -6064,11 +6141,36 @@ def import_desktop_accounts(realm=None):
 def desktop_credential_scan():
     """Read-only scan of the desktop client credentials on this machine."""
     return wb_accounts.scan_desktop_credentials()
+def _credits_summary(credits):
+    """积分摘要：列表只留总额，packages 明细摘掉。
+
+    真实池子上 /accounts 的 6.03 MB 里 87.9% 是每个账号的 packages 明细，而列表页
+    一个字段都不显示它（明细只在积分弹窗里看）。列表因此只给摘要 + 两个标记：
+    packagesReady（服务端已有缓存明细，弹窗可以 refresh:false 秒开）与
+    packagesCount。**必须复制再摘**：public() 里的 credits 与 account.credits 是
+    同一个 dict，原地 pop 会把内存里的明细也删掉，下次开弹窗就得重新打上游。
+    """
+    if not isinstance(credits, dict):
+        return credits
+    summary = dict(credits)
+    packages = summary.pop("packages", None)
+    summary["packagesReady"] = isinstance(packages, list) and len(packages) > 0
+    summary["packagesCount"] = len(packages) if isinstance(packages, list) else 0
+    return summary
+
+
 def account_views(realm=None):
-    """List view of every account, including a live readiness flag."""
+    """List view of every account, including a live readiness flag.
+
+    credits 走 _credits_summary：列表只要总额，明细留给 /accounts/credits/detail。
+    """
     if not POOL:
         return []
-    return POOL.list_public(realm=realm)
+    rows = POOL.list_public(realm=realm)
+    for row in rows:
+        if isinstance(row, dict) and "credits" in row:
+            row["credits"] = _credits_summary(row["credits"])
+    return rows
 
 
 def _finite_number(value):
@@ -18113,8 +18215,8 @@ def _release_key_slot(key_entry):
 # 之后一两秒）。集中一处是因为按路由各写一遍已经漏过两回：/console/toggle 与
 # /shutdown 修好之后，/updates/check、/updates/install、/quota-scan/run 又漏了。
 # 新增这类「不读 body」的面板路由，请加进这个元组，别在路由里另写一份。
-BODYLESS_PANEL_POSTS = ("/console/toggle", "/shutdown", "/updates/check",
-                        "/updates/install", "/quota-scan/run")
+BODYLESS_PANEL_POSTS = ("/console/toggle", "/shutdown", "/hotswap",
+                        "/updates/check", "/updates/install", "/quota-scan/run")
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -18136,7 +18238,7 @@ class Handler(BaseHTTPRequestHandler):
     # bare "414 Request-URI Too Long" for anything longer. Raise it and reply in
     # the normal JSON error shape so an over-long URL is diagnosable.
     max_request_line = 1024 * 1024
-    def handle_one_request(self):
+    def _handle_one_request_impl(self):
         # Reset per-request auth state. HTTP/1.1 keeps the connection alive, so
         # one Handler instance serves many requests; a request that authenticates
         # via the panel token never reassigns key_entry, and without this reset
@@ -18187,6 +18289,22 @@ class Handler(BaseHTTPRequestHandler):
             return
         getattr(self, mname)()
         self.wfile.flush()
+    def handle_one_request(self):
+        # 热切换的排空依据：进入一条请求 +1，处理完 -1。旧进程一旦进入 draining，
+        # 每条连接做完手上这条响应就关闭（客户端下次请求自然落到新进程的监听上），
+        # 但正在生成的那一条不会被切断。真正的请求循环在 _handle_one_request_impl：
+        # 这里只包一层计数，不能顶掉 max_request_line / JSON 414 那套自定义解析。
+        with _HOTSWAP_LOCK:
+            _HOTSWAP["active"] = int(_HOTSWAP["active"]) + 1
+        try:
+            return self._handle_one_request_impl()
+        finally:
+            with _HOTSWAP_LOCK:
+                _HOTSWAP["active"] = max(0, int(_HOTSWAP["active"]) - 1)
+                draining = _HOTSWAP["phase"] == "draining"
+            if draining:
+                self.close_connection = True
+
     def handle(self):
         try:
             super().handle()
@@ -18216,9 +18334,22 @@ class Handler(BaseHTTPRequestHandler):
         log(fmt % args)
     def _json(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        # 大响应体压缩：/accounts 单次 6.0MB、dashboard 1.0MB。只在客户端声明
+        # 接受 gzip 且超过 1KB 时压缩；超过 1MB 用 level 1（29ms），其余 level 6。
+        _gz = None
+        if len(body) > 1024 and "gzip" in (self.headers.get("Accept-Encoding") or "").lower():
+            try:
+                _gz = gzip.compress(body, 1 if len(body) > 1048576 else 6)
+            except Exception:
+                _gz = None
+        if _gz is not None:
+            body = _gz
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        if _gz is not None:
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
         # 只有 _json_cached() 覆盖的只读接口才有校验符；其余调用点保持原样，
         # 一个头都不多发。
         etag = self._json_etag
@@ -18756,6 +18887,35 @@ class Handler(BaseHTTPRequestHandler):
         _PINNED.account = account
         return True
 
+    def _route_hotswap(self):
+        """把监听交给一个新进程；本进程排空后自行退出。"""
+        with _HOTSWAP_LOCK:
+            phase = _HOTSWAP["phase"]
+        if phase in ("starting", "draining"):
+            return self._json(200, {"ok": False, "busy": True,
+                                    "state": _hotswap_state()})
+        # 起进程放在请求线程里做：Popen 只要几毫秒，而响应带上 child_pid 才能让
+        # 驱动脚本知道「新的是谁」——接管之后旧进程不再 accept，回头就问不到了。
+        try:
+            child, ready_path = _hotswap_spawn(self.server)
+        except Exception as exc:
+            _hotswap_update(phase="failed", error=str(exc))
+            log("hotswap   : could not start the new process - %s" % exc)
+            return self._error(500, "hotswap failed: %s" % exc)
+        _hotswap_update(phase="starting", child_pid=child.pid, started=time.time(),
+                        error="")
+        # daemon=False：解释器只在非 daemon 线程结束后才真正退出，所以主线程从
+        # serve_forever() 返回时，不会把还在排空的请求线程一起带走。
+        worker = threading.Thread(target=_hotswap_worker,
+                                  args=(self.server, child, ready_path),
+                                  name="hotswap", daemon=False)
+        worker.start()
+        return self._json(200, {"ok": True, "started": True,
+                                "state": _hotswap_state()})
+
+    def _get_hotswap_status(self):
+        return self._json(200, _hotswap_state())
+
     def do_OPTIONS(self):
         self._strip_pinned_prefix_only()
         self.send_response(204)
@@ -18780,6 +18940,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._get_agents_cli()
         if self._is_panel_route(path) and not self._panel_ok():
             return self._error(401, "panel password required", "invalid_request_error")
+        if path == "/hotswap/status":
+            # 热切换进度只给本机驱动脚本看（它会轮询到 phase 变成 draining），
+            # 与面板其他管理写入同一个门：X-Panel-Token。
+            if not self._panel_ok():
+                return self._error(401, "panel password required", "invalid_request_error")
+            return self._get_hotswap_status()
         if path in ("/", "/dashboard", "/ui"):
             return self._get_dashboard()
         if path == "/panel/status":
@@ -18800,6 +18966,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._get_usage_recent(query)
         if path == "/accounts/credits/detail":
             return self._get_account_credits_detail(query)
+        if path == "/accounts/credits/status":
+            return self._get_accounts_credits_status()
         if path == "/accounts/credits":
             return self._get_accounts_credits()
         if path == "/accounts/credits/grants":
@@ -19043,17 +19211,17 @@ class Handler(BaseHTTPRequestHandler):
     def _get_accounts_credits(self):
         if not self._authorized():
             return
-        # Refresh credits for all accounts —— 全池扫，吃单飞与拟人间隔
-        # （见 _credits_sweep 的说明）。已有一次在跑时不排队、不报错：直接把当前
-        # 快照回给调用方，前端拿到的仍是可用数据。
+        # 全池刷移交后台（_credits_sweep_async）：数百个账号按拟人间隔串下来要
+        # 6~10 分钟，同步跑会把这条请求和发起它的浏览器一起挂住。这里只回执，
+        # 前端轮询 /accounts/credits/status 看进度。已有一次在跑时不排队、不报错。
         targets = list(POOL.accounts) if POOL else []
-        busy = not _credits_sweep_begin()
-        if not busy:
-            try:
-                _credits_sweep(targets)
-            finally:
-                _credits_sweep_end()
-        return self._json_panel(200, {"accounts": account_views(), "busy": busy})
+        return self._json_panel(200, _credits_sweep_async(targets))
+
+    def _get_accounts_credits_status(self):
+        if not self._authorized():
+            return
+        # 只读进度，不发上游请求：前端每 2 秒问一次，直到 busy 变 False。
+        return self._json_panel(200, _credits_progress_view())
 
     def _get_account_credits_grants(self):
         """积分获取历史：只读账号积分快照，不发上游请求。
@@ -19392,6 +19560,16 @@ class Handler(BaseHTTPRequestHandler):
             b'data-ui-language="__WB_UI_LANGUAGE__"',
             ('data-ui-language="%s"' % language).encode("utf-8"),
         )
+        # 首屏静态页同样走压缩：1.0MB 的 dashboard.html 压到约 300KB，手机 /
+        # Tailscale 远程访问的首屏传输按比例缩短。判定条件与 _json() 一致：客户端
+        # 声明接受 gzip 且响应体超过 1KB 才压，否则逐字节原样发出。
+        encoding = None
+        if len(body) > 1024 and "gzip" in (self.headers.get("Accept-Encoding") or "").lower():
+            try:
+                body = gzip.compress(body, 6)
+                encoding = "gzip"
+            except Exception:
+                encoding = None
         # 面板首页是纯静态资源（服务端逐字节原样发出、不含任何机密），所以可以
         # 允许浏览器存储副本、每次打开再回源校验：校验命中回 304（无 body），
         # 省下整页（约 470KB）的重复下载，手机 / Tailscale 远程访问体感最明显。
@@ -19408,7 +19586,11 @@ class Handler(BaseHTTPRequestHandler):
             st = os.stat(DASHBOARD_HTML)
             # 强校验符（不带 W/ 前缀）：响应是「文件字节 + 本次语言」的精确副本，
             # tag 变 ⇔ 字节变。
-            etag = '"%x-%x-%s"' % (st.st_mtime_ns, st.st_size, language)
+            # 压缩属于内容编码：同一份字节的 gzip 变体与 identity 变体是两个表示，
+            # tag 必须区分，否则共享缓存会把压缩副本当成未压缩的那一份回给不支持
+            # gzip 的客户端。
+            etag = '"%x-%x-%s%s"' % (
+                st.st_mtime_ns, st.st_size, language, "-gz" if encoding else "")
         except Exception:
             # stat 取不到（或时间戳无法表示）不是致命错误：退化为一律按普通
             # 200 处理，只是这一次没有条件请求支持，绝不让面板页本身打不开。
@@ -19429,6 +19611,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(304)
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("ETag", etag)
+                self.send_header("Vary", "Accept-Encoding")
                 self.end_headers()
                 return
         self.send_response(200)
@@ -19440,6 +19623,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         if etag is not None:
             self.send_header("ETag", etag)
+        # 响应随 Accept-Encoding 变化，必须声明，否则中间缓存会把 gzip 变体原样
+        # 发给不支持它的客户端。
+        self.send_header("Vary", "Accept-Encoding")
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
         self.end_headers()
         self.wfile.write(body)
     def _read_chunked_body(self, max_bytes=MAX_PAYLOAD_BYTES):
@@ -20817,16 +21005,20 @@ class Handler(BaseHTTPRequestHandler):
         # 多账号目标才吃单飞与拟人间隔：单账号刷新本来就只发一次请求，不该被别人的
         # 全量刷挡住，也不该为它空等一个间隔。
         multi = len([t for t in targets if t is not None]) > 1
-        if multi and not _credits_sweep_begin():
-            # 已有一次全量刷在跑：不排队、不重复轰炸上游，把当前快照原样回给调用方。
-            return self._json_panel(200, {"results": [], "accounts": account_views(),
-                                          "busy": True})
-        try:
-            results = _credits_sweep(targets, paced=multi)
-        finally:
-            if multi:
-                _credits_sweep_end()
-        return self._json_panel(200, {"results": results, "accounts": account_views()})
+        if not multi:
+            # 单账号刷新本来就只发一次请求：同步跑，点了立刻有反应，不吃间隔。
+            results = _credits_sweep(targets, paced=False)
+            return self._json_panel(200, {"ok": True, "results": results,
+                                          "started": False, "busy": False,
+                                          "total": len(results), "done": len(results),
+                                          "accounts": account_views()})
+        # 多账号（按区域 / 全池）：移交后台，回执照旧带 results 与 busy 字段，
+        # 老前端读到 busy 也不会当成错误。
+        ack = _credits_sweep_async(targets)
+        ack["ok"] = True
+        ack["results"] = []
+        ack["accounts"] = account_views()
+        return self._json_panel(200, ack)
 
     def _route_account_credits_detail(self, payload):
         if not self._authorized():
@@ -22176,6 +22368,11 @@ class Handler(BaseHTTPRequestHandler):
             # 根本不发 body，排空会一直等一个永远不会到的载荷。
             self._handle_expect_continue()
             self._discard_body()
+        if path == "/hotswap":
+            # 面板/驱动脚本触发的热切换：不重启进程，只换掉正在跑的进程。
+            if not self._panel_ok():
+                return self._error(401, "panel password required", "invalid_request_error")
+            return self._route_hotswap()
         if path == "/console/toggle":
             # Panel-only management write: 收起/唤出本进程自己的控制台窗口，
             # 与设置、定价那几个写入同一个门。按钮带 `{}` body，
@@ -22795,12 +22992,18 @@ def main():
         # 退出码就是给 cmd.exe 的判断条件：0 = 已有实例（或端口被别的服务占着，
         # 那条错误由 _probe_running_instance 自己打印），3 = 端口是空的，可以起。
         raise SystemExit(0 if _probe_running_instance(args) else 3)
-    if _probe_running_instance(args):
+    if args.inherit_socket is None and _probe_running_instance(args):
         return
     api_key_generated = _bootstrap_runtime(args)
-    if _report_first_run(args):
-        return
-    _log_startup_summary(args, api_key_generated)
+    if args.inherit_socket is not None:
+        # 热切换接管进程：端口那个内核 socket 已经在本进程手里了，不用再探测；
+        # 也不必把整份账号清单再往日志里写一遍。
+        log("hotswap   : took over the listening socket (pid %d)" % os.getpid())
+        _hold_scheduler_until(args.hotswap_from_pid)
+    else:
+        if _report_first_run(args):
+            return
+        _log_startup_summary(args, api_key_generated)
     _serve_forever(args)
 
 def _parse_cli_args():
@@ -22830,6 +23033,15 @@ def _parse_cli_args():
                     help="only check whether a proxy already listens on the port and "
                          "print what the launcher should say, then exit "
                          "(0 = one is running, 3 = the port is free)")
+    ap.add_argument("--inherit-socket", type=int, default=None,
+                    help="internal: adopt an already-listening socket handle "
+                         "inherited from the previous process (see /hotswap)")
+    ap.add_argument("--handover-ready", default=None,
+                    help="internal: file to write once the inherited socket is "
+                         "being served (see /hotswap)")
+    ap.add_argument("--hotswap-from-pid", type=int, default=None,
+                    help="internal: pid of the process that handed the socket "
+                         "over, held in the scheduler gate until it exits")
     args = ap.parse_args()
     return args
 
@@ -23088,6 +23300,234 @@ def _log_startup_summary(args, api_key_generated):
         print()
         sys.stdout.flush()
 
+# ---------------------------------------------------------------- hot swapping
+# 换掉正在跑的服务进程（例如把仓库里的新版 wb_proxy.py 铺上去）通常意味着停
+# 进程、再起进程，而监听端口随进程一起消失：更新窗口里到达的请求直接
+# connection refused，正在生成的流被切断。这里换个做法——把监听 socket 的句柄
+# 交给新进程（Windows 上句柄可以继承，父子引用的是同一个内核对象，端口从头到
+# 尾没有关过），新进程接住之后旧进程停止 accept、把手上的请求做完再退出。
+#
+# 流程：POST /hotswap（本机驱动脚本触发）-> 旧进程起子进程 -> 子进程接管监听并
+# 写 ready 文件 -> 旧进程排空后 os._exit(0)。GET /hotswap/status 报进度。
+HOTSWAP_START_TIMEOUT = 180.0
+HOTSWAP_DRAIN_TIMEOUT = 600.0
+_HOTSWAP_LOCK = threading.Lock()
+_HOTSWAP = {"phase": "idle", "child_pid": None, "active": 0,
+            "started": 0.0, "error": ""}
+
+
+def _hotswap_update(**fields):
+    with _HOTSWAP_LOCK:
+        _HOTSWAP.update(fields)
+
+
+def _hotswap_state():
+    with _HOTSWAP_LOCK:
+        state = dict(_HOTSWAP)
+    state["draining"] = state["phase"] == "draining"
+    state["pid"] = os.getpid()
+    return state
+
+
+def _build_server(args):
+    """监听 socket：自己绑，或者接管上一个进程交过来的那一个。
+
+    继承来的 socket 早就 bind + listen 完了，连排队在内核 backlog 里的连接都还
+    在；关掉重绑等于把队列扔掉，所以这里直接把对象接过来用。
+    """
+    handle = getattr(args, "inherit_socket", None)
+    if handle is None:
+        return GatewayServer((args.host, args.port), Handler)
+    sock = socket.socket(fileno=int(handle))
+    server = GatewayServer((args.host, args.port), Handler, bind_and_activate=False)
+    try:
+        server.socket.close()
+    except Exception:
+        pass
+    server.socket = sock
+    server.server_address = sock.getsockname()
+    server.server_name, server.server_port = server.server_address[:2]
+    return server
+
+
+def _write_handover_marker(path):
+    """告诉父进程「这边已经在 accept 了」。
+
+    顺序是关键：先接管 socket、再打日志、最后写标记，父进程看到标记才停止
+    accept。反过来就会出现两边都没在收连接的窗口。
+    """
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(str(os.getpid()))
+            fh.flush()
+            os.fsync(fh.fileno())
+    except OSError as exc:
+        log("hotswap   : could not write the ready marker (%s)" % exc)
+
+
+def _inheritable_handle(sock):
+    """把监听 socket 的句柄标成可继承，返回句柄值。"""
+    handle = sock.fileno()
+    if IS_WINDOWS:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        if not kernel32.SetHandleInformation(ctypes.c_void_p(handle), 1, 1):
+            raise OSError("SetHandleInformation failed on handle %d" % handle)
+    else:
+        os.set_inheritable(handle, True)
+    return handle
+
+
+def _pid_alive(pid):
+    """进程还在不在。Windows 上没有 kill(pid, 0)，只能问内核要退出码。"""
+    try:
+        pid = int(pid)
+        if pid <= 0:
+            return False
+        if IS_WINDOWS:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong(0)
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return False
+                return code.value == 259  # STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _hold_scheduler_until(from_pid):
+    """接管之后先别跑定时任务，等旧进程真的排空退出。
+
+    两个进程同时跑调度器，签到 / 保活 / 每日活跃会在同一时刻把同一个账号点两遍
+    （账号侧看到的就是重复请求）。旧进程退出即恢复，和重启后的默认状态一致。
+    """
+    if SCHEDULER is None or not from_pid:
+        return
+    try:
+        SCHEDULER.enabled = False
+    except Exception:
+        return
+
+    def _wait():
+        deadline = time.time() + HOTSWAP_START_TIMEOUT * 5
+        while time.time() < deadline and _pid_alive(from_pid):
+            time.sleep(0.2)
+        if SCHEDULER is not None:
+            SCHEDULER.enabled = True
+        log("hotswap   : previous process is gone, scheduler resumed")
+
+    threading.Thread(target=_wait, name="hotswap-hold", daemon=True).start()
+
+
+def _hotswap_child_argv(handle, ready_path):
+    """重建子进程命令行：沿用本次启动的全部参数，只换掉交接用的两项。"""
+    drop = ("--inherit-socket", "--handover-ready", "--hotswap-from-pid")
+    kept = []
+    tokens = list(sys.argv[1:])
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token.split("=", 1)[0] in drop:
+            index += 1 if "=" in token else 2
+            continue
+        kept.append(token)
+        index += 1
+    return [sys.executable, os.path.abspath(sys.argv[0])] + kept + [
+        "--inherit-socket", str(handle), "--handover-ready", ready_path,
+        "--hotswap-from-pid", str(os.getpid())]
+
+
+def _hotswap_spawn(server):
+    """把监听 socket 的句柄交给一个新进程，返回 (子进程, ready 文件路径)。"""
+    ready_path = os.path.join(tempfile.gettempdir(),
+                              "wb-hotswap-%d.ready" % os.getpid())
+    try:
+        os.remove(ready_path)
+    except OSError:
+        pass
+    handle = _inheritable_handle(server.socket)
+    argv = _hotswap_child_argv(handle, ready_path)
+    log("hotswap   : launching %s" % " ".join(argv[1:]))
+    # close_fds=False 在 Windows 上是继承自定义句柄的唯一途径：标准库的
+    # close_fds=True 会走 PROC_THREAD_ATTRIBUTE_HANDLE_LIST，列表外的句柄一个
+    # 都过不去，监听 socket 也在其中。代价是别的可继承句柄一并带过去，这里能
+    # 过去的只有监听 socket 与标准流。
+    child = subprocess.Popen(argv, close_fds=False, cwd=os.getcwd(),
+                             env=dict(os.environ))
+    return child, ready_path
+
+
+def _hotswap_worker(server, child, ready_path):
+    """等新进程接住监听，再排空本进程手上的请求后退出。"""
+    try:
+        deadline = time.time() + HOTSWAP_START_TIMEOUT
+        while time.time() < deadline:
+            if os.path.exists(ready_path):
+                break
+            if child.poll() is not None:
+                raise RuntimeError("the new process exited with %s before it "
+                                   "started listening" % child.returncode)
+            time.sleep(0.05)
+        else:
+            raise RuntimeError("the new process did not start listening "
+                               "within %ss" % int(HOTSWAP_START_TIMEOUT))
+        log("hotswap   : pid %s is serving, draining this process" % child.pid)
+        _hotswap_update(phase="draining")
+        try:
+            if SCHEDULER is not None:
+                SCHEDULER.enabled = False
+        except Exception:
+            pass
+        server.shutdown()
+        try:
+            server.server_close()
+        except Exception:
+            pass
+        deadline = time.time() + HOTSWAP_DRAIN_TIMEOUT
+        while time.time() < deadline:
+            with _HOTSWAP_LOCK:
+                active = int(_HOTSWAP["active"])
+            if active <= 0:
+                break
+            time.sleep(0.05)
+        with _HOTSWAP_LOCK:
+            active = int(_HOTSWAP["active"])
+        log("hotswap   : drained (%d request(s) still open), exiting" % active)
+        try:
+            flush_log_channel(0.5)
+        except Exception:
+            pass
+        os._exit(0)
+    except Exception as exc:
+        _hotswap_update(phase="failed", error=str(exc))
+        log("hotswap   : failed - %s" % exc)
+        if child.poll() is None:
+            try:
+                if IS_WINDOWS:
+                    # venv 的 pythonw.exe 只是转发器：真正跑 wb_proxy 的是它拉起
+                    # 的孙进程，单杀转发器会把孙进程留成孤儿继续占着端口。
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(child.pid)],
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=30)
+                else:
+                    child.terminate()
+            except Exception:
+                pass
+    finally:
+        try:
+            os.remove(ready_path)
+        except OSError:
+            pass
+
+
 class GatewayServer(ThreadingHTTPServer):
     """主服务的 HTTP 服务类：只为把 listen backlog 从 stdlib 默认的 5 提到 128。
 
@@ -23101,7 +23541,7 @@ class GatewayServer(ThreadingHTTPServer):
 
 def _serve_forever(args):
     try:
-        server = GatewayServer((args.host, args.port), Handler)
+        server = _build_server(args)
     except OSError as exc:
         # Port stolen between the probe above and this bind, or held by
         # something that does not answer /health: report it in plain words
@@ -23128,6 +23568,8 @@ def _serve_forever(args):
         _key_state = "off"
     log(f"listening  : http://{args.host}:{args.port}/v1  (api key: {_key_state})")
     log(f"dashboard  : http://{args.host}:{args.port}/")
+    if getattr(args, "handover_ready", None):
+        _write_handover_marker(args.handover_ready)
     # Keep the handler referenced for the process lifetime: SetConsoleCtrlHandler
     # stores a raw pointer, so a collected callback would crash on close.
     _ctrl_handler = install_console_close_handler()

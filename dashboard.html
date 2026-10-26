@@ -3922,7 +3922,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
         运行日志
       </button>
     </nav>
-    <a class="gh-link" href="https://github.com/ardeyouxipianyi/workbuddy2api-hub" target="_blank" rel="noopener noreferrer"
+    <a class="gh-link" href="https://github.com/HimA6652/workbuddy2api-hub" target="_blank" rel="noopener noreferrer"
        title="查看 GitHub 项目仓库" aria-label="GitHub 项目仓库">
       <svg viewBox="0 0 16 16" aria-hidden="true">
         <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/>
@@ -9049,25 +9049,69 @@ async function loadAccounts(){
     // 昵称刚到位，补画一次积分扣减历史：它和本请求是并行的，先渲染的那次只有 uid。
     if(LAST_CREDIT_DATA) renderCreditHistory();
     // Auto-fetch credits once if not present
-    if(window.ACCOUNTS.length && window.ACCOUNTS.some(a => !a.credits)){
+    // 只补一次：原先 128 个停用号永远拿不到 credits，条件恒真 -> 每 15 秒一次
+    // 全池积分扫（POST /accounts/credits）+ 一份 6MB 响应 + 再整表重画。
+    if(!window.__creditsAutoTried && window.ACCOUNTS.some(a => a.enabled && !a.credits)){
+      window.__creditsAutoTried = true;
+      // 后台刷只回执 started/busy，回执里不再带 accounts：绝不能拿它覆盖
+      // window.ACCOUNTS（r.accounts 是空数组时会把整张表清空）。进度靠轮询。
       postJSON('/accounts/credits', {}).then(r => {
-        window.ACCOUNTS = r.accounts || ACCOUNTS;
-        renderAccounts();
+        if(r && (r.started || r.busy)) pollCreditsSweep(null);
       }).catch(()=>{});
     }
   }catch(e){ toast('账号加载失败: ' + e.message); }
+}
+
+// 后台刷积分的进度轮询：POST /accounts/credits 现在只回执（started/busy），
+// 真正的全池刷新在服务端线程里按拟人间隔慢慢跑（数百个账号约 6~10 分钟），
+// 进度只能靠 GET /accounts/credits/status 问；跑完重拉一次账号表。
+// 网关断线时 getJSON 的 promise 不 settle，所以每次询问都套一层超时兜底：
+// 按钮不能因为一次断线永远停在「刷新中」。
+function withTimeout(promise, ms){
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = (value) => { if(!settled){ settled = true; resolve(value); } };
+    const timer = setTimeout(() => finish(null), ms);
+    Promise.resolve(promise).then(v => { clearTimeout(timer); finish(v); },
+                                     () => { clearTimeout(timer); finish(null); });
+  });
+}
+
+async function pollCreditsSweep(btn, onTick, viewName){
+  const STEP_MS = 2000;
+  const DEADLINE_MS = 20 * 60 * 1000;   // 数百个账号按 0.8~1.2s 间隔最多约 10 分钟
+  const until = Date.now() + DEADLINE_MS;
+  let last = { done: 0, total: 0 };
+  while(Date.now() < until){
+    const st = await withTimeout(getJSON('/accounts/credits/status', POLL_READ), 8000);
+    if(st){
+      last = { done: st.done || 0, total: st.total || 0 };
+      if(typeof onTick === 'function') onTick(last.done, last.total);
+      if(!st.busy) break;
+    }
+    await new Promise(res => setTimeout(res, STEP_MS));
+  }
+  await loadAccounts();
+  refresh();
+  return last;
 }
 
 async function fetchCredits(btn){
   if(btn){ btn.disabled = true; btn.textContent = '刷新中...'; }
   const currentView = (window.VIEW_REALM || "intl");
   const viewName = currentView === 'cn' ? '国内版' : '国际版';
+  const startedAt = Date.now();
   try{
     const r = await postJSON('/accounts/credits', {realm: currentView});
-    await loadAccounts();
-    refresh();
-    const count = (r.results || []).length;
-    toast('已成功刷新当前' + viewName + ' ' + count + ' 个账号的积分', 'ok');
+    if(r && r.busy && !r.started){
+      toast('已有一轮积分刷新在跑，跟着它的进度走', 'ok');
+    }
+    const finalState = await pollCreditsSweep(btn, (done, total) => {
+      if(btn) btn.textContent = '刷新中 ' + done + '/' + (total || '?');
+    }, viewName);
+    const total = (r && r.total) || finalState.total || 0;
+    toast('已刷新' + viewName + ' ' + total + ' 个账号的积分（' +
+          Math.round((Date.now() - startedAt) / 1000) + 's）', 'ok');
   }catch(e){
     toast('刷新积分失败: ' + e.message, 'bad');
   }finally{
@@ -9763,7 +9807,31 @@ async function openCreditsDetail(uid, forceRefresh = false){
     return;
   }
 
+  // 列表载荷只带摘要（packages 明细已从 /accounts 摘掉），但服务端还留着缓存：
+  // packagesReady 说明可以直接吃缓存、不打上游，弹窗因此仍然秒开。
+  if(!forceRefresh && acct && acct.credits && acct.credits.packagesReady){
+    const cachedDetail = await fetchCreditsDetailCached(acct.uid);
+    if(cachedDetail){
+      CURRENT_CREDITS_DATA = cachedDetail;
+      acct.credits = cachedDetail;
+      renderAccounts();
+      renderCreditsDetail(cachedDetail, acct);
+      return;
+    }
+  }
+
   await reloadCreditsDetail();
+}
+
+// 吃服务端缓存明细：refresh:false 只读 account.credits，不打上游。
+// 列表载荷只剩摘要（packagesReady），弹窗要画有效期就得把明细单独要回来。
+async function fetchCreditsDetailCached(uid){
+  if(!uid) return null;
+  try{
+    const res = await postJSON("/accounts/credits/detail", { uid: uid, refresh: false });
+    if(res && res.ok && res.credits) return res.credits;
+  }catch(e){ /* 缓存拿不到就回落到强制刷新，不打扰用户 */ }
+  return null;
 }
 
 async function reloadCreditsDetail(btn){
@@ -10858,7 +10926,9 @@ async function startDashboard(){
     // 一张表不必在它的 render 函数里再写一行，下一轮自己就接上了。
     setInterval(() => { if(!document.hidden){ refresh(); applyAllTableSorts(); } }, 5000),
     setInterval(() => { if(!document.hidden) loadSchedulerStatus(); }, 30000),
-    setInterval(() => { if(!document.hidden) loadAccounts(); }, 15000),
+    // 15s -> 60s：一轮 loadAccounts 实测 4.3 秒主线程（期间整页冻结），
+    // 15 秒一轮等于 29% 的时间在卡；切回前台本来就会补一次刷新。
+    setInterval(() => { if(!document.hidden) loadAccounts(); }, 60000),
   ];
   if(!visHookInstalled){
     visHookInstalled = true;
@@ -17859,6 +17929,10 @@ if (typeof SORT_DENY_TABLES !== 'undefined' && SORT_DENY_TABLES && SORT_DENY_TAB
   function enhance(sel){
     if (!sel || sel.dataset.csDone === '1') return;
     if (sel.closest('.cs-wrap')) return;
+    // 账号表约 300 行、每 15 秒整表重画：逐个包装 select 实测要 4.3 秒，
+    // 是面板每隔十几秒卡一下的全部原因。表里的 select 用原生控件，深色主题
+    // 由 [data-theme="dark"] select{color-scheme:dark} 兜住。
+    if (sel.closest('#accounts')) return;
     sel.dataset.csDone = '1';
 
     var wrap = document.createElement('span');

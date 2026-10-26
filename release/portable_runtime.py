@@ -79,7 +79,7 @@ REQUIRED_FILES = (
     "Lib/argparse.py", "Lib/base64.py", "Lib/bisect.py", "Lib/calendar.py", "Lib/datetime.py",
     "Lib/difflib.py", "Lib/fnmatch.py", "Lib/getpass.py", "Lib/gzip.py", "Lib/heapq.py",
     "Lib/ipaddress.py", "Lib/queue.py", "Lib/shutil.py", "Lib/random.py",
-    "Lib/subprocess.py", "Lib/threading.py", "Lib/sqlite3/__init__.py",
+    "Lib/subprocess.py", "Lib/tempfile.py", "Lib/threading.py", "Lib/sqlite3/__init__.py",
     "Lib/posixpath.py", "Lib/signal.py", "Lib/zipfile/__init__.py",
     "Lib/html/__init__.py", "Lib/http/__init__.py", "Lib/http/client.py",
     "Lib/concurrent/__init__.py", "Lib/concurrent/futures/__init__.py",

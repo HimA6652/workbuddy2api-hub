@@ -22,7 +22,7 @@ import time
 import urllib.request
 import zipfile
 
-REPO_DEFAULT = "ardeyouxipianyi/workbuddy2api-hub"
+REPO_DEFAULT = "HimA6652/workbuddy2api-hub"
 UPDATES_DIR = "updates"
 STATUS_NAME = "status.json"
 MANIFEST_NAME = "release-manifest.json"

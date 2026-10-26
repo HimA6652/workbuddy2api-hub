@@ -202,18 +202,31 @@ class SweepTests(unittest.TestCase):
 
 
 class RouteWiringTests(unittest.TestCase):
-    """两条路由真的接了护栏，且释放走 finally（异常也不能把锁留在手里）。"""
+    """两条路由真的接了护栏，且释放走 finally（异常也不能把锁留在手里）。
 
-    def test_get_accounts_credits_wires_guard(self):
+    全池刷改成后台线程之后，CAS 单飞与 finally 释放搬进了 _credits_sweep_async：
+    handler 只挑目标、回执，谁抢锁、谁在 finally 里放，都在那一个函数里钉住。
+    套件因此改盯 _credits_sweep_async —— 把护栏搬走不是放松，换个人绕过同一个坑
+    照样应该红。
+    """
+
+    def test_get_accounts_credits_runs_in_the_background(self):
         src = inspect.getsource(wb_proxy.Handler._get_accounts_credits)
+        self.assertIn("_credits_sweep_async", src,
+                      "GET /accounts/credits 必须走后台刷，否则 数百个账号会把请求挂死")
+        self.assertIn("busy", inspect.getsource(wb_proxy._credits_sweep_async),
+                      "被单飞拒掉时要显式告诉调用方这不是错误")
+
+    def test_background_sweep_still_holds_the_single_flight(self):
+        src = inspect.getsource(wb_proxy._credits_sweep_async)
         self.assertIn("_credits_sweep_begin", src)
         self.assertIn("_credits_sweep_end", src)
-        self.assertIn("finally", src, "释放必须在 finally 里，否则异常会把CAS 单飞永久留下")
-        self.assertIn('"busy"', src, "被单飞拒掉时要显式告诉调用方这不是错误")
+        self.assertIn("finally", src, "释放必须在 finally 里，否则异常会把 CAS 单飞永久留下")
+        self.assertIn("busy", src, "被单飞拒掉时要显式告诉调用方这不是错误")
 
     def test_post_accounts_credits_only_guards_multi_account(self):
         src = inspect.getsource(wb_proxy.Handler._route_accounts_credits_fetch)
-        self.assertIn("_credits_sweep_begin", src)
+        self.assertIn("_credits_sweep_async", src)
         self.assertIn("multi", src, "单账号刷新不该被别人的全量刷挡住")
         self.assertIn("busy", src)
 
