@@ -57,3 +57,20 @@ desktop.ini
 
 # Local Docker Compose override
 docker-compose.override.yml
+
+
+# 本机控制面板（panel/）：实际配置含面板密码，运行期文件每次启动都变，都不入库
+panel/config.json
+panel/run.pid
+panel/*.bak-*
+panel/__pycache__/
+
+# 性能补丁脚本 patch_panel.py 留下的自动备份
+*.bak-perf-*
+
+# 本地联调用的隔离数据目录（账号副本 / 用量 / 日志）
+_devdata/
+
+# 本机部署后的接入说明与私记（含真实地址与密钥，绝不入库）
+LAN-ACCESS.md
+NOTES.local.md

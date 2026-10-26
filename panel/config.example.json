@@ -1,0 +1,11 @@
+{
+  "panel_host": "127.0.0.1",
+  "panel_port": 8790,
+  "service_port": 8788,
+  "python_exe": "",
+  "lan": false,
+  "panel_password": "admin",
+  "start_timeout": 35,
+  "stop_timeout": 15,
+  "open_browser": true
+}
