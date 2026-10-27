@@ -88,6 +88,7 @@ import wb_modelsdev
 import wb_probes
 import wb_updates
 import wb_update_request
+import wb_model_queue
 IS_WINDOWS = os.name == "nt"
 
 # ---- 一键配置客户端（wb_agents）的可用性判定（issue #246）----
@@ -11923,25 +11924,6 @@ SANITIZE_DSH_GUI_RE = re.compile(
     r" whose URL the runtime context names\.")
 SANITIZE_DSH_GUI_REPLACEMENT = r"\1 whose URL is named in the runtime context."
 SANITIZE_DSH_GUI_LOWER = "whose url the runtime context names"
-# DSH 运行时上下文里的「@ 路径引用」段（#575）：上游 WAF 把 A 句 + B 句紧邻出现
-# 判成非官方渠道。这段文字出自 @deepseek-ai/dsh-file-reference 的
-# FILE_REFERENCE_PROMPT（dsh-file-reference/lib/index.js:54），每个带
-# runtime-context 注入的会话都会带一遍。逐句二分实测：
-#   - A 句单独放行，B 句单独放行，只有 A + 单个空格 + B 连续出现才 400；
-#   - 大小写不敏感，但空白必须严格是单个空格：双空格 / 制表符 / 换行 / 无空格
-#     全都失配，所以这里按单空格字面量锚定，不做空白泛化（会改掉上游本来放行的文本）；
-#   - 只命中 system / developer / assistant；同一段放进 user / tool / function 放行
-#     （tool 缺 tool_call_id 会报另外的错，不是这条指纹）。
-# 只把 B 句开头换成 Paths resolve relative to：A 句原样保留，句意不变，成指纹的
-# 连续结构被打破。句尾的 `; absolute paths identify ...` 不在指纹里，不动。
-SANITIZE_DSH_FILEREF_LOWER = (
-    "tokens prefixed with @ are paths the user explicitly referenced. "
-    "relative paths resolve from the workspace root")
-SANITIZE_DSH_FILEREF_RE = re.compile(
-    r"(?i)(Tokens prefixed with @ are paths the user explicitly referenced\.)"
-    r"( Relative paths resolve from the workspace root)")
-SANITIZE_DSH_FILEREF_REPLACEMENT = (
-    r"\1 Paths resolve relative to the workspace root")
 # 品牌词缩减（#574）：`DeepSeek Harness` 单独出现放行，但它和 GUI 描述句
 # （`this page` / `this GUI` / `this app`）连续出现时命中同一套 11-128 校验。
 # 逐段二分实测：只把品牌缩成 `DeepSeek` 就能通过，句子其余部分不用动；
@@ -11999,10 +11981,6 @@ def has_fingerprint(text, identity=True):
     if (SANITIZE_DSH_GUI_LOWER in low
             and SANITIZE_DSH_GUI_RE.search(text) is not None):
         return True
-    # @ 路径引用段：同上，字面量前置筛 + 正则确认。
-    if (SANITIZE_DSH_FILEREF_LOWER in low
-            and SANITIZE_DSH_FILEREF_RE.search(text) is not None):
-        return True
     # 动词短语只是廉价前置筛：真命中与否交给正则判定。这样 "powered by" 出现在
     # 与自我介绍无关的句子（工具/插件的产品描述）时不会走进 sanitize_text 的其余
     # 清洗步骤，也不会白白改写。
@@ -12023,8 +12001,6 @@ def sanitize_text(text, identity=True):
         text = SANITIZE_IDENTITY_RE.sub(SANITIZE_IDENTITY_REPLACEMENT, text)
         # GUI 描述段单独一条规则：锚定整句，只调整句尾语序。
         text = SANITIZE_DSH_GUI_RE.sub(SANITIZE_DSH_GUI_REPLACEMENT, text)
-        # @ 路径引用段：只改 B 句开头，A 句原样保留。
-        text = SANITIZE_DSH_FILEREF_RE.sub(SANITIZE_DSH_FILEREF_REPLACEMENT, text)
         # 品牌词缩减放在最后：GUI 规则还认全名，先让它匹配原文。
         text = SANITIZE_BRAND_RE.sub(SANITIZE_BRAND_REPLACEMENT, text)
     for old, new in SANITIZE_REWRITES:
@@ -13752,6 +13728,9 @@ class ContentRejected(Exception):
         return 403
 
 
+MODEL_QUEUE_GATE = wb_model_queue.ModelQueueGate()
+
+
 class RateLimited(Exception):
     """Upstream throttled this model (429 / code 6004). Distinct from a dead
     pool: the credential is fine, only the model is cooling down for a while."""
@@ -13764,7 +13743,21 @@ class RateLimited(Exception):
         # daily token guard) carry their own text instead of the upstream
         # wording.
         self.message = message or ""
+        self.upstream_code = None
+        self.queue_scope = None
+        self.account_uid = None
         super().__init__("upstream rate limit: %s" % (self.detail[:200] or "429"))
+
+
+class ModelQueueLimited(RateLimited):
+    """A shared model/endpoint queue, deliberately not an Account failure."""
+
+    def __init__(self, detail="", wait=60, upstream_code=None, scope=None):
+        super().__init__(None, detail, wait=wait,
+                         message="upstream model queue busy; retry in %ds" % max(1, int(wait)))
+        self.upstream_code = upstream_code
+        self.queue_scope = scope
+        self.queue_code = upstream_code
 
 
 def gateway_hint(status, message):
@@ -14632,6 +14625,33 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                   allow_credit_fallback=True, allow_product_switch=True,
                   pin_account=None, defer_egress_success=False,
                   allowed_accounts=None):
+    # The retry implementation owns all resources; this outer lifecycle wrapper
+    # also covers exceptions before urlopen (body encoding, headers, readiness).
+    lifecycle = {}
+    def register_cleanup(callback):
+        lifecycle["cleanup"] = callback
+    def run_cleanup():
+        callback = lifecycle.get("cleanup")
+        if callback is not None:
+            callback()
+    try:
+        return _open_upstream_attempts(payload, session_key=session_key,
+            target_realm=target_realm, prebuilt_body=prebuilt_body,
+            allow_credit_fallback=allow_credit_fallback,
+            allow_product_switch=allow_product_switch, pin_account=pin_account,
+            defer_egress_success=defer_egress_success,
+            allowed_accounts=allowed_accounts, register_cleanup=register_cleanup)
+    finally:
+        # Success already cleared queue_pending and transferred slot_held to
+        # the response. Any other exit is still cleaned here, including errors
+        # before the transport try and immediate ModelQueueLimited exits.
+        run_cleanup()
+
+
+def _open_upstream_attempts(payload, session_key=None, target_realm=None, prebuilt_body=None,
+                  allow_credit_fallback=True, allow_product_switch=True,
+                  pin_account=None, defer_egress_success=False,
+                  allowed_accounts=None, register_cleanup=None):
     # Refresh the daily guards before picking. The scan underneath is
     # incremental and TTL-cached, so this is a stat() plus a cached dict on
     # the hot path, and an account parked by any of the guards is skipped
@@ -14649,6 +14669,84 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     realm = target_realm or detect_model_realm(payload.get("model")) or CURRENT_REALM
     model = str(payload.get("model") or "")
     pinned = pin_account if pin_account is not None else pinned_account()
+    # Preflight uses the default endpoint without selecting an account or
+    # touching its cursor; the real account retargets the scope below.
+    queue_scope = (realm, model, "workbuddy", wb_identity.endpoint_for(realm, "workbuddy")[0])
+    queue_token = False
+    queue_pending = False
+    # Declared before cleanup registration so even early exits have a valid
+    # request-scoped slot cell. The actual acquisition happens below.
+    slot_held = None
+    # Anonymous preflight only guards a single-product endpoint. In a mixed
+    # pool (or with opt-in product switching) the actual account decides the
+    # scope; otherwise the default endpoint could block another product.
+    mixed_products = False
+    if POOL is not None:
+        mixed_products = len({(getattr(a, "product", "") or "", a.chat_base_url())
+                              for a in POOL.accounts if a.realm == realm}) > 1
+    queue_preflight = (not mixed_products
+                       and pinned is None
+                       and not (allow_product_switch and auto_switch_product_enabled())
+                       and all((a.realm, model, getattr(a, "product", "") or "",
+                                a.chat_base_url()) == queue_scope
+                               for a in getattr(POOL, "accounts", ()) or ()
+                               if a.realm == realm))
+
+    def queue_retarget(account, url=None, product=None):
+        nonlocal queue_scope, queue_token, queue_pending
+        target = wb_model_queue.queue_scope(account, model, url, product=product)
+        if target == queue_scope:
+            return
+        # A scope can change during automatic product switching. Do not carry
+        # an old endpoint's lease into a new endpoint's Gate.
+        if queue_pending:
+            MODEL_QUEUE_GATE.abandon(queue_scope, queue_token)
+        queue_scope, queue_token, queue_pending = target, False, False
+
+    def queue_admit():
+        nonlocal queue_token, queue_pending
+        if queue_pending:
+            return
+        # Keep an existing half-open lease across an inconclusive retry. The
+        # transport/HTTP failure path explicitly releases it before continuing.
+        proceed, wait, token = MODEL_QUEUE_GATE.begin(queue_scope)
+        if not proceed:
+            raise ModelQueueLimited(wait=wait, scope=queue_scope)
+        queue_token = token
+        queue_pending = wb_model_queue.ModelQueueGate._probe_token(token) is not False
+
+    def queue_note(detail):
+        nonlocal queue_pending
+        code, data = wb_model_queue.classify(detail)
+        if code is None:
+            return None
+        retry_after = data.get("retry_after")  # seconds, unlike estimated_wait (ms)
+        wait = MODEL_QUEUE_GATE.fail(queue_scope, queue_token, retry_after)
+        queue_pending = False
+        log("model queue %s busy for %r (code %s), retry in %ds; no account cooldown"
+            % (realm, model, code, wait), level="WARN")
+        return ModelQueueLimited(detail, wait=wait, upstream_code=code, scope=queue_scope)
+
+    def queue_inconclusive():
+        nonlocal queue_pending
+        if queue_pending:
+            MODEL_QUEUE_GATE.abandon(queue_scope, queue_token)
+            queue_pending = False
+
+    def cleanup_request():
+        """Release every request-scoped resource on any non-success exit.
+
+        The outer finally also covers pretransport body/header failures; success
+        already cleared the Gate and transferred the account slot to the body.
+        """
+        nonlocal slot_held
+        queue_inconclusive()
+        if slot_held is not None:
+            account_slot_release(slot_held)
+            slot_held = None
+    register_cleanup(cleanup_request)
+    if pinned is not None:
+        queue_scope = wb_model_queue.queue_scope(pinned, model)
     if pinned is not None:
         if allowed_accounts is not None and pinned.uid not in allowed_accounts:
             raise PinnedAccountError(
@@ -14666,6 +14764,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     # 失败、一个上游请求都不发——继续打只会把同一台设备上的其他账号也送走。
     hold = restriction_hold_remaining(realm)
     if hold > 0:
+        queue_inconclusive()
         raise RateLimited(None, "upstream account restriction in effect",
                           wait=int(hold) + 1,
                           message=restriction_hold_message(realm, hold))
@@ -14701,6 +14800,10 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     else:
         ready_total = POOL.count_ready(realm, model=model)
     total = 1 if pinned is not None else max(1, ready_total)
+    # Admit only after every request-wide initializer that can fail. This keeps
+    # a local body/readiness error from occupying the one half-open lease.
+    if queue_preflight:
+        queue_admit()
     tried = set()
     # 这一轮请求已经记过账的账号：重试轮（transient_hits 后 tried.clear() 整池
     # 重轮）会把同一个账号再挑一遍，若每次都记，一次请求就能给同一个账号记上
@@ -14737,6 +14840,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
         return True
 
     last_error = None
+    last_queue_error = None
     last_uid = None
     last_429 = None
     last_429_detail = ""
@@ -14786,7 +14890,6 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     busy = set()
     # 当前这一轮已经占住、但还没交给调用方的账号名额。任何失败路径都要归还
     # （循环开头统一处理），成功路径把它绑到响应对象上后置空。
-    slot_held = None
     def pick_account():
         """按当前 exclude/busy 选一个账号，并占住它的在飞名额。
 
@@ -14868,7 +14971,47 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
         last_uid = account.uid
         slot_held = account
         cfg = wb_accounts.get_realm_config(account.realm)
-        chat_url = account.chat_base_url() + CHAT_PATH
+        # URL and product must come from one snapshot. A concurrent product
+        # switch must not move this attempt's 6020/6021 to another scope.
+        attempt_product = getattr(account, "product", "") or ""
+        chat_url = wb_identity.endpoint_for(account.realm, attempt_product)[0] + CHAT_PATH
+        # Automatic product switching may have changed the endpoint even on
+        # the first upstream attempt. Every retry uses its actual scope.
+        queue_retarget(account, chat_url, attempt_product)
+        if auto_switch and not MODEL_QUEUE_GATE.check(queue_scope)[0]:
+            # A previous 6020/6021 is equivalent queue evidence to the 429 that
+            # normally drives this existing opt-in switch. Never demote or cool
+            # the account just because its current model queue is full.
+            _try_switch_product(account, model)
+            attempt_product = getattr(account, "product", "") or ""
+            chat_url = wb_identity.endpoint_for(account.realm, attempt_product)[0] + CHAT_PATH
+            queue_retarget(account, chat_url, attempt_product)
+        try:
+            queue_admit()
+        except ModelQueueLimited as exc:
+            # A queue on this account's endpoint is not a credential failure.
+            # Keep affinity/cursor semantics unchanged and try the next ordinary
+            # candidate; an independent product endpoint can still serve.
+            if auto_switch and _try_switch_product(account, model):
+                tried.discard(account.uid)
+                queue_inconclusive()
+                continue
+            if pinned is None:
+                queue_inconclusive()
+                # Every candidate may be blocked by its own endpoint Gate.
+                # Preserve the queue error instead of reporting an empty pool.
+                if last_queue_error is None or exc.wait < last_queue_error.wait:
+                    last_queue_error = exc
+                if attempt < max_attempts:
+                    continue
+                raise
+            account_slot_release(account)
+            slot_held = None
+            raise
+        except Exception:
+            account_slot_release(account)
+            slot_held = None
+            raise
         # The cache key is account scoped, so it is rebuilt per candidate rather
         # than once up front. Opt-in only: measurement showed the upstream
         # caches prefixes without it (see prompt_cache_key_enabled).
@@ -14914,9 +15057,17 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
         req = urllib.request.Request(chat_url, data=attempt_data, method="POST",
                                      headers=req_headers)
         req.wb_exact_headers = list(req_headers.items())
+        # Scope can change after automatic product switching. Re-admit only
+        # then; otherwise one real request keeps its original admission/lease.
+        if queue_scope != wb_model_queue.queue_scope(
+                account, model, chat_url, product=attempt_product):
+            queue_retarget(account, chat_url, attempt_product)
+            queue_admit()
         try:
             resp = wb_accounts.urlopen(req, timeout=header_timeout,
                                        proxy=account.proxy)
+            MODEL_QUEUE_GATE.success(queue_scope, queue_token)
+            queue_pending = False
             _apply_stream_idle_timeout(resp, idle_timeout)
             account.note_success(model=model)
             if egress_backoff and not defer_egress_success:
@@ -14939,9 +15090,16 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
         except urllib.error.HTTPError as exc:
             if exc.code == 429:
                 try:
-                    detail = read_http_error(exc, 600).decode("utf-8", "replace")
+                    detail = read_http_error(exc, wb_model_queue.QUEUE_ERROR_BODY_LIMIT).decode("utf-8", "replace")
                 except Exception:
                     detail = ""
+                queue_error = queue_note(detail)
+                if queue_error is not None:
+                    if slot_held is not None:
+                        account_slot_release(slot_held)
+                        slot_held = None
+                    raise queue_error
+                queue_inconclusive()
                 reset_at = parse_rate_limit_reset(detail)
                 if rate_limit_is_account_level(detail, reset_at):
                     wait = account.note_soft_rate("HTTP 429 (account soft rate)")
@@ -15011,6 +15169,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 last_429 = exc
                 last_429_detail = detail
                 continue
+            queue_inconclusive()
             if exc.code == 403:
                 try:
                     detail = read_http_error(exc, 600).decode("utf-8", "replace")
@@ -15088,6 +15247,11 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                             % account.uid[:8])
                         tried.discard(account.uid)
                         refresh_uid = account.uid
+                        # A pinned route has one account, not one transport
+                        # attempt: its single successful token refresh earns
+                        # exactly one retry on that same account.
+                        if pinned is not None:
+                            max_attempts += 1
                         last_error = exc
                         continue
                 log("account %s rejected (HTTP 401), rotating" % account.uid[:8])
@@ -15099,7 +15263,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             if exc.code == 400:
                 diag_capture_11128(attempt_body, req_headers, exc,
                                    model=model, account=account,
-                                   product=getattr(account, "product", None),
+                                   product=attempt_product,
                                    session_key=session_key)
                 # A 400 is passed through unchanged. `11158` (model not allowed
                 # for this user type) used to be recorded here for the model
@@ -15148,6 +15312,12 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 continue
             raise
         except Exception as exc:
+            if isinstance(exc, ModelQueueLimited):
+                if slot_held is not None:
+                    account_slot_release(slot_held)
+                    slot_held = None
+                raise
+            queue_inconclusive()
             if wb_accounts.is_tls_verify_error(exc):
                 # One attempt is enough: the chain is the same for every
                 # account, and retrying only multiplies the failed handshakes.
@@ -15204,9 +15374,12 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             continue
     # 循环可能从 break 退出（TLS 校验失败、已知硬错误），这时本轮占的名额还在
     # 手上；成功路径已经在 return 前把它交给响应对象并置空，所以这里释放是安全的。
+    queue_inconclusive()
     if slot_held is not None:
         account_slot_release(slot_held)
         slot_held = None
+    if last_queue_error is not None:
+        raise last_queue_error
     # Only spend credits after every enabled, credential-bearing account in
     # this realm has a persisted upstream 6004 cap for this free model. The
     # switch is opt-in because the retry can incur real charges.
@@ -15359,6 +15532,16 @@ def open_upstream_with_fallback(payload, session_key=None, target_realm=None,
     realm = target_realm or detect_model_realm(payload.get("model")) or CURRENT_REALM
 
     def _backup_or_raise(exc):
+        if (isinstance(exc, ModelQueueLimited)
+                and getattr(exc, "queue_scope", None) is not None):
+            # A scope that is still OPEN has no reason to spend this request on
+            # another realm. Preserve the caller's retry clock and account=None.
+            try:
+                proceed, _wait = MODEL_QUEUE_GATE.check(exc.queue_scope)
+            except Exception:
+                proceed = True
+            if not proceed:
+                raise exc
         if not allow_realm_fallback or not realm_fallback_enabled():
             raise exc
         backup = realm_fallback_target(realm, payload.get("model"))
@@ -15481,7 +15664,10 @@ def probe_account(account, model=None, timeout=30):
     row = {"uid": account.uid, "nickname": account.nickname or account.uid[:8],
            "realm": account.realm, "model": model, "ok": False, "elapsed_ms": 0,
            "status": None, "reply": "", "error": "", "network": False}
-    chat_url = account.chat_base_url() + CHAT_PATH
+    # Keep the manual probe on the same attempt snapshot as the normal route:
+    # a concurrent product switch must not attribute its response to a new scope.
+    attempt_product = getattr(account, "product", "") or ""
+    chat_url = wb_identity.endpoint_for(account.realm, attempt_product)[0] + CHAT_PATH
     test_body = {"model": model, "messages": [{"role": "user", "content": "hi"}],
                  "stream": False}
     probe_body = build_upstream_body(test_body)
@@ -15502,9 +15688,18 @@ def probe_account(account, model=None, timeout=30):
     req = urllib.request.Request(chat_url, data=body, method="POST",
                                  headers=probe_headers)
     req.wb_exact_headers = list(probe_headers.items())
+    scope = wb_model_queue.queue_scope(account, model, chat_url,
+                                       product=attempt_product)
+    proceed, wait, token = MODEL_QUEUE_GATE.begin(scope)
+    if not proceed:
+        row.update({"error": "model queue busy; retry in %ds" % wait,
+                    "model_queue": True, "retry_after": wait, "status": 429})
+        return row
     t0 = time.time()
     try:
         with wb_accounts.urlopen(req, timeout=timeout, proxy=account.proxy) as resp:
+            MODEL_QUEUE_GATE.success(scope, token)
+            token = False
             chat_obj = aggregate_stream(resp, model, None)
             row["elapsed_ms"] = int((time.time() - t0) * 1000)
             choices = chat_obj.get("choices") or []
@@ -15523,10 +15718,12 @@ def probe_account(account, model=None, timeout=30):
     except urllib.error.HTTPError as exc:
         row["elapsed_ms"] = int((time.time() - t0) * 1000)
         try:
-            detail = read_http_error(exc, 400).decode("utf-8", "replace")
+            detail = read_http_error(exc, wb_model_queue.QUEUE_ERROR_BODY_LIMIT).decode("utf-8", "replace")
         except Exception:
             detail = str(exc)
         if looks_like_local_network(exc):
+            MODEL_QUEUE_GATE.abandon(scope, token)
+            token = False
             row["network"] = True
             row["error"] = "本机网络不可用：%s" % exc_detail(exc)
             account.note_error(row["error"], cooldown=0)
@@ -15535,6 +15732,15 @@ def probe_account(account, model=None, timeout=30):
         # panel can show the whole upstream body on hover.
         row["status"] = exc.code
         row["error"] = "HTTP %d: %s" % (exc.code, detail[:150])
+        queue_code, queue_data = wb_model_queue.classify(detail)
+        if queue_code is not None:
+            wait = MODEL_QUEUE_GATE.fail(scope, token, queue_data.get("retry_after"))
+            token = False
+            row.update({"queue_code": queue_code, "retry_after": wait,
+                        "model_queue": True})
+            return row
+        MODEL_QUEUE_GATE.abandon(scope, token)
+        token = False
         if exc.code == 403 and restriction_is_account_level(detail):
             # 测试也认账号级风控限制：不能用 60 秒的普通冷却把 2 小时覆盖掉，
             # 更不能用「测试通过」的语义把被限制的账号放回池子（见 #422）。
@@ -15550,6 +15756,8 @@ def probe_account(account, model=None, timeout=30):
         row["fails"] = int(account.fails)
         return row
     except Exception as exc:
+        MODEL_QUEUE_GATE.abandon(scope, token)
+        token = False
         row["elapsed_ms"] = int((time.time() - t0) * 1000)
         if wb_accounts.is_tls_verify_error(exc):
             row["error"] = wb_accounts.tls_verify_hint(exc)
@@ -18741,6 +18949,7 @@ class Handler(BaseHTTPRequestHandler):
                 "type": "rate_limit_error",
                 "code": 429,
                 "retry_after": wait,
+                "upstream_code": getattr(exc, "upstream_code", None),
             }
         }, ensure_ascii=False).encode("utf-8")
         self.send_response(429)
@@ -18760,8 +18969,12 @@ class Handler(BaseHTTPRequestHandler):
             text += " - " + str(exc.detail)[:200]
         self._handle_expect_continue()
         self._discard_body()
-        body = json.dumps(anthropic_error_obj(429, text, "rate_limit_error"),
-                          ensure_ascii=False).encode("utf-8")
+        body_obj = anthropic_error_obj(429, text, "rate_limit_error")
+        upstream_code = getattr(exc, "upstream_code", None)
+        if upstream_code is not None:
+            body_obj["error"]["upstream_code"] = upstream_code
+            body_obj["error"]["retry_after"] = wait
+        body = json.dumps(body_obj, ensure_ascii=False).encode("utf-8")
         self.send_response(429)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -19217,6 +19430,7 @@ class Handler(BaseHTTPRequestHandler):
             "accounts": len(POOL.accounts) if POOL else 0,
             "accounts_ready": POOL.count_ready() if POOL else 0,
             "api_key_required": auth_required(),
+            "model_queues": MODEL_QUEUE_GATE.snapshot(),
         }
         if self._key_ok():
             info.update({

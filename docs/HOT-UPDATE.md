@@ -183,7 +183,7 @@ python scripts\hotswap_update.py --bootstrap
 ```bash
 python tests/_test_hotswap.py       # 32 项：交接、排空、调度器互斥、压测、/health 自述 PID
 python tests/_test_panel_status.py  # 21 项：幽灵 PID、自述优先、conflict、坏配置
-python tests/run_all.py             # 全量（237 个套件）
+python tests/run_all.py             # 全量（套件数以当前 README 为准）
 ```
 
 `_test_hotswap.py` 用一个**临时实例**跑，不碰生产：

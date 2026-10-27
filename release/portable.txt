@@ -60,6 +60,7 @@ wb_identity.py
 wb_ipintel.py
 wb_logstore.py
 wb_modelsdev.py
+wb_model_queue.py
 wb_pricing.py
 wb_probes.py
 wb_prompt.py
