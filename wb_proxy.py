@@ -14121,6 +14121,57 @@ def read_http_error(exc, limit=600):
         return b""
 
 
+# 11128 取证开关：上游渠道校验（400 / code 11128「Illegal API invocation from
+# an unapproved channel」）是唯一一条「请求体本身有问题」的失败——换号、重试、
+# 降级提示词都救不了，只能把触发的文本认出来加进 sanitize 规则。默认关闭：
+# hub 目录下没有 _diag_11128 这个文件时整个函数第一行就返回，线上零开销。
+# 排查时 touch _diag_11128 打开，失败的请求体原样落盘到 _diag/11128-*.json
+# （请求体 + 出站身份头 + 上游回绝详情），删掉文件即关闭。
+DIAG_11128_FLAG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "_diag_11128")
+
+
+def diag_capture_11128(body, headers, exc, model=None, account=None,
+                       product=None, session_key=None):
+    if not os.path.exists(DIAG_11128_FLAG):
+        return
+    try:
+        try:
+            detail = read_http_error(exc, 8000).decode("utf-8", "replace")
+        except Exception:
+            detail = ""
+        if "11128" not in detail and "11-128" not in detail:
+            return
+        here = os.path.dirname(os.path.abspath(__file__))
+        out_dir = os.path.join(here, "_diag")
+        try:
+            os.makedirs(out_dir)
+        except OSError:
+            pass
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(out_dir, "11128-%s-%03d.json"
+                            % (stamp, int(time.time() * 1000) % 1000))
+        record = {
+            "time": stamp,
+            "model": model,
+            "account": (account.uid[:8] if account is not None else None),
+            "product": product,
+            "session_key": session_key,
+            "detail": detail,
+            "headers": dict(headers or []),
+            "body": body,
+        }
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(record, fh, ensure_ascii=False, default=str)
+        log("11128 diag: dumped %s (%d bytes)"
+            % (path, os.path.getsize(path)), level="WARN")
+    except Exception as dump_exc:
+        try:
+            log("11128 diag dump failed: %s" % dump_exc, level="WARN")
+        except Exception:
+            pass
+
+
 def model_scoped_errors_penalize_account():
     """Escape hatch: restore the old "any 5xx charges the account" behaviour."""
     raw = os.environ.get("WB_MODEL_SCOPED_ERRORS_PENALIZE", "")
@@ -15021,6 +15072,10 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 last_error = exc
                 continue
             if exc.code == 400:
+                diag_capture_11128(attempt_body, req_headers, exc,
+                                   model=model, account=account,
+                                   product=getattr(account, "product", None),
+                                   session_key=session_key)
                 # A 400 is passed through unchanged. `11158` (model not allowed
                 # for this user type) used to be recorded here for the model
                 # catalogue label; the tier map from `/v3/config` now drives
