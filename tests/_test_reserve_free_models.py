@@ -86,6 +86,15 @@ class AccountReserveFreeModelTests(unittest.TestCase):
             else:
                 self.assertTrue(acc.ready(model), model)
 
+    def test_cooldown_wait_keeps_the_free_model_exemption(self):
+        acc = account("uid-cool", 0, free={FREE})
+        acc.reserve_credits = 1
+        acc.model_cooldowns[FREE] = 9e18
+        self.assertTrue(acc.blocked_by_model_cooldown(FREE))
+        self.assertFalse(acc.blocked_by_model_cooldown(PAID))
+        self.assertFalse(acc.blocked_by_model_cooldown(UNKNOWN))
+        self.assertFalse(acc.blocked_by_model_cooldown())
+
     def test_default_reserve_stays_off(self):
         acc = account("uid-default", 0, free={FREE})
         self.assertEqual(acc.reserve_credits, 0)

@@ -15896,7 +15896,12 @@ def _open_upstream_attempts(payload, session_key=None, target_realm=None, prebui
         raise last_error
     throttled, wait = realm_model_throttled(realm, model)
     if throttled:
-        raise RateLimited(None, "usage exceeds frequency limit", wait=wait)
+        # 说清在等什么、等多久：客户端看到 "usage exceeds frequency limit"
+        # 时不知道是哪个模型、还有多久能好，于是照旧立刻重试（issue #665）。
+        reason = ("every usable account in realm '%s' is cooling the upstream %s "
+                  "window; the pool resumes in %ds" % (realm, model, wait))
+        raise RateLimited(None, "usage exceeds frequency limit", wait=wait,
+                          message=reason)
     enabled = [a for a in POOL.accounts
                if a.realm == realm and a.enabled and a.access_token] if POOL else []
     if enabled and all(a.daily_limit_blocked() for a in enabled):
@@ -15927,9 +15932,29 @@ def _open_upstream_attempts(payload, session_key=None, target_realm=None, prebui
                   "request(s) (account_max_concurrent=%d); retry shortly or "
                   "raise the cap" % (limit, limit))
         raise RateLimited(None, reason, wait=1, message=reason)
-    raise RuntimeError("no usable account for realm '%s': all are disabled, cooling down, "
-                       "expired or parked by the daily token limit%s"
-                       % (realm, pool_unavailable_detail(realm, model)))
+    candidates = [a for a in enabled
+                  if allowed_accounts is None or a.uid in allowed_accounts]
+    if (model and candidates
+            and all(a.blocked_by_model_cooldown(model) for a in candidates)):
+        # 全部候选都只差"这个模型的上游窗口恢复"：这是**等待**，不是故障。
+        # 503 + "去面板加号" 解决不了上游配额，只会让客户端立刻重试（真机
+        # 实测 24ms 一轮、3 分钟 12 次）；429 + Retry-After 才会让客户端等到
+        # 恢复时刻（issue #665）。
+        until = min(a.model_cooldown_until(model) for a in candidates)
+        wait = max(1, int(until - time.time()))
+        reason = ("every candidate account is waiting for the upstream %s window "
+                  "to reset (%d account(s), earliest reset in %ds); the pool is "
+                  "idle, not broken - retry after the reset"
+                  % (model, len(candidates), wait))
+        raise RateLimited(None, detail=reason, wait=wait, message=reason)
+    scope = ""
+    if allowed_accounts:
+        scope = ("; this API key may use %d account(s)" % len(allowed_accounts))
+    raise RuntimeError("no usable account for realm '%s': every candidate is "
+                       "disabled, cooling down, expired, out of upstream quota "
+                       "or parked by a local limit%s%s"
+                       % (realm, scope,
+                          pool_unavailable_detail(realm, model, allowed_accounts)))
 
 
 # ---- 跨出口回退：国际版 → 国内版（开关默认关）--------------------------------
@@ -16054,7 +16079,7 @@ def open_upstream_with_fallback(payload, session_key=None, target_realm=None,
     return open_upstream(payload, session_key=session_key,
                          target_realm=backup, **kwargs)
 
-def pool_unavailable_detail(realm, model=None):
+def pool_unavailable_detail(realm, model=None, allowed_accounts=None):
     """把该区域每个账号不可用的原因拼成一句，附在「没有可用账号」后面。
 
     这句话以前只列了四种可能（停用 / 冷却 / 过期 / 日限额），而 v1.6.16 之后
@@ -16064,11 +16089,20 @@ def pool_unavailable_detail(realm, model=None):
     排查的人只能对着「明明有 9 个账号」的池子猜。
 
     这里不改变判定，只把判定结果说出来：每个不可用账号「八位 UID + 原因」。
+
+    `allowed_accounts` 给定时只列**真正参与本次派发**的账号：API Key 可以
+    绑定账号，绑定之外的号再健康也轮不到。把它们列进来只会把排查的人引去
+    看整个区域——真机上就是这样：Key 绑的 2 个号在冷却，报错却列了全区 4 个
+    在冷却的号，而 2 个健康的号（没绑这个 Key）一个字都没提（issue #665）。
     """
     if POOL is None:
         return ""
     accounts = [a for a in POOL.accounts if a.realm == realm]
+    if allowed_accounts is not None:
+        accounts = [a for a in accounts if a.uid in allowed_accounts]
     if not accounts:
+        if allowed_accounts is not None:
+            return "；本 Key 绑定的账号都不在 %s 区" % realm
         return "；该区域没有任何账号"
     reasons = []
     for account in accounts:
