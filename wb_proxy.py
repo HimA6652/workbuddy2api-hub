@@ -14930,12 +14930,16 @@ def _apply_stream_idle_timeout(response, seconds):
         return False
 
 
-def schedule_window_probe(account, model, reset_at):
+def schedule_window_probe(account, model, reset_at, cap=False, cap_at=0.0):
     """把上游给出的重置时刻登记给窗口探针（wb_window_probe）。
 
     上游的额度窗口按首次请求起算，到点无人请求就不会开始新一轮，所以这个
     时刻要在后台被主动用掉，而不是只当作一段冷却。登记本身不能影响请求
     路径：任何异常都只写日志，本次 429 照常换号重试。
+
+    `cap` 说明这条窗口是上游 6004 判定额度用满；连同撞线时刻一起落盘，
+    于是**任何模型**（不只免费模型）重启后仍然知道"这是配额用尽、撞线于
+    何时"，面板不会把它误写成一次临时限流（issue #668）。
     """
     if not reset_at or account is None or not model:
         return False
@@ -14945,7 +14949,8 @@ def schedule_window_probe(account, model, reset_at):
     accounts_dir = getattr(POOL, "dir", "") or ACCOUNTS_DIR
     try:
         import wb_window_probe
-        return wb_window_probe.schedule(accounts_dir, account.uid, model, reset_at)
+        return wb_window_probe.schedule(accounts_dir, account.uid, model, reset_at,
+                                         cap=cap, cap_at=cap_at)
     except Exception as exc:
         log("window probe schedule failed: %s" % exc)
         return False
@@ -15551,7 +15556,19 @@ def _open_upstream_attempts(payload, session_key=None, target_realm=None, prebui
                                    cooldown=wait, detail=detail)
                 # 除了记冷却，还要把重置时刻交给后台探针：到点主动发一个最小
                 # 请求，把新一轮窗口的计时起点钉在那一刻（窗口按首次请求起算）。
-                schedule_window_probe(account, model, reset_at)
+                #
+                # 「达到限额」的唯一标志是上游返回 6004（用户口径）：别的 429
+                # 即使带重置墙钟也不构成额度判定。这个事实跟窗口一起落盘，
+                # 于是**任何模型**（含国内版按积分计费的 deepseek-v4.1-flash）
+                # 都能保住"配额用尽 + 撞线时刻"，面板不会把它误写成一次临时
+                # 限流（issue #668）。凭证档的 model_caps 仍只覆盖免费模型：
+                # 那是限额联动的范围，与"这是不是配额用尽"是两件事。
+                is_cap = rate_limit_is_cap(detail)
+                cap_at = time.time() if is_cap else 0.0
+                if is_cap:
+                    account.model_cap_marks[model] = cap_at
+                schedule_window_probe(account, model, reset_at, cap=is_cap,
+                                      cap_at=cap_at)
                 if reset_at:
                     # A cap with a reset clock is the one observable moment the
                     # window budget can be measured from; the usage rows alone
@@ -15562,7 +15579,7 @@ def _open_upstream_attempts(payload, session_key=None, target_realm=None, prebui
                     # 429 即使带重置墙钟也不构成额度判定，不记 cap、不写盘。
                     # 记录范围（免费模型）由 note_model_cap 把守——范围外的
                     # 模型返回 False，重启后自动放开，不参与持久化禁用。
-                    if rate_limit_is_cap(detail):
+                    if is_cap:
                         try:
                             if account.note_model_cap(model, reset_at):
                                 _save_account_caps(account, model, reset_at)

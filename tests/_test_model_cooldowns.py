@@ -679,6 +679,11 @@ class ModelCooldownTests(unittest.TestCase):
 
         既有的运行时冷却不受影响：429 带时钟时仍停到时钟（这条语义有测试钉住，
         不随限额联动改变）。
+
+        #668 之后有一处变化：**面板**要分得清「配额用满」与「临时限流」，所以
+        撞线时刻（cappedAt）对任何模型都给。但限额联动的范围不变——下面两行
+        仍然成立：凭证档的 modelCaps 仍为空、凭证档仍不写盘（重启后靠窗口
+        记录恢复，而不是靠持久化禁用）。
         """
         for realm, model in (("cn", "glm-5.3"), ("cn", "deepseek-v4.1-flash"),
                              ("intl", "glm-5.3")):
@@ -696,7 +701,8 @@ class ModelCooldownTests(unittest.TestCase):
                                  "%s/%s 不在限额联动范围内" % (realm, model))
                 row = account.public()["modelCooldowns"][0]
                 self.assertEqual(row["model"], model)
-                self.assertNotIn("cappedAt", row)
+                # 面板据此写「该模型配额耗尽（code 6004）」而不是「临时限流」。
+                self.assertIn("cappedAt", row)
                 self.assertLessEqual(abs(row["expiresAt"] - reset), 2,
                                      "运行时仍按上游时钟停到点")
                 self.assertFalse(os.path.exists(os.path.join(

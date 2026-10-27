@@ -1024,6 +1024,16 @@ class Account(object):
         # otherwise a single throttled model blackholes every request on the pool.
         # Deliberately runtime-only (not persisted): see VOLATILE_FIELDS.
         self.model_cooldowns = {}
+        # 「这条冷却是上游判定额度用满（6004）」的标记：模型 -> 撞线时刻。
+        # 与 model_cooldowns 同款运行时态（重启即清零），但窗口探针会把
+        # 事实落在 accounts/model_windows.json 里，重启后由
+        # restore_window_cooldowns() 连同冷却一起挂回来（issue #668）。
+        #
+        # 为什么单独一张表：凭证档的 model_caps 只覆盖免费模型（限额联动的
+        # 范围），收费模型撞 6004 一样是"配额用尽"，但它不写 model_caps，
+        # 于是面板把它显示成"429 临时限流（60s~10m 的短窗口）"，而真实恢复
+        # 时刻在 20 小时以后。
+        self.model_cap_marks = {}
         # 每个模型冷却窗口是**什么时候挂上的**（model -> epoch）。model_cooldowns
         # 只留恢复时刻，起始时刻以前被丢掉：面板因此无法如实说「限流时刻」，只能
         # 用「—」占位，把 60s 的短时 parking 和几小时的 6004 撞线画成一样。与
@@ -1240,8 +1250,22 @@ class Account(object):
                 entry["startedAt"] = int(started)
             # 撞线时间只在 cap 还在恢复期内时带上：它同时说明这次禁用是
             # 「额度用满」（6004）而不是一次临时限流，面板据此显示两段时间。
+            #
+            # 两个来源：凭证档的 model_caps（免费模型，限额联动范围内），以及
+            # 运行时/窗口探针记下的 model_cap_marks（任何模型，含国内版按积分
+            # 计费的 deepseek-v4.1-flash）。后者补上的是"付费模型撞 6004"这个
+            # 事实——不补的话面板只能写成"临时限流（60s~10m）"，而真实恢复
+            # 时刻在 20 小时以后（issue #668）。
+            capped_at = 0
             if self.cap_until(model, now) > 0:
-                entry["cappedAt"] = int(self.model_caps[model]["at"])
+                capped_at = int(self.model_caps[model]["at"])
+            else:
+                try:
+                    capped_at = int(self.model_cap_marks.get(model) or 0)
+                except (TypeError, ValueError):
+                    capped_at = 0
+            if capped_at:
+                entry["cappedAt"] = capped_at
             models.append(entry)
         return error, deadline, models, detail, restricted
 
@@ -4503,6 +4527,16 @@ class AccountPool(object):
                     continue
                 if account.arm_model_cooldown(model, row.get("reset_at")):
                     restored.setdefault(uid, []).append(model)
+                # 这条窗口是上游判定额度用满（6004）时，把撞线时刻一起挂回来：
+                # 面板据此显示"配额耗尽"而不是"临时限流"，重启后也不丢这个
+                # 事实（凭证档的 model_caps 只覆盖免费模型，issue #668）。
+                if row.get("cap"):
+                    try:
+                        cap_at = float(row.get("cap_at") or 0.0)
+                    except (TypeError, ValueError):
+                        cap_at = 0.0
+                    if cap_at:
+                        account.model_cap_marks[model] = cap_at
         for uid, mids in sorted(restored.items()):
             self.log("account %s: 模型 %s 仍在上游限流窗口内（重启后按窗口恢复）"
                      % (uid[:8], ", ".join(mids)))
