@@ -309,6 +309,77 @@ class IdentityVerbVariantsTests(unittest.TestCase):
         self.assertEqual(out[2]["content"], fp)
 
 
+class DshFileReferenceParagraphTests(unittest.TestCase):
+    """DSH 运行时上下文里「@ 路径引用」段的渠道指纹（#575）。
+
+    这段文字出自 @deepseek-ai/dsh-file-reference 的 FILE_REFERENCE_PROMPT，
+    每个带 runtime-context 注入的会话都会带一遍。逐句二分实测：A 句单独放行、
+    B 句单独放行，只有 A + 单个空格 + B 连续出现才 400；大小写不敏感，但空白
+    必须严格是单个空格（双空格 / 制表符 / 换行 / 无空格都失配）；只命中
+    system / developer / assistant，user / tool / function 放行。
+    """
+
+    A = "Tokens prefixed with @ are paths the user explicitly referenced."
+    B = "Relative paths resolve from the workspace root;"
+    B_REWORDED = "Paths resolve relative to the workspace root;"
+    TAIL = " absolute paths identify files or directories on the host."
+
+    def test_pair_reworded(self):
+        out = P.sanitize_text(self.A + " " + self.B + self.TAIL)
+        self.assertEqual(out, self.A + " " + self.B_REWORDED + self.TAIL)
+
+    def test_sentence_a_untouched(self):
+        # A 句本身不是指纹，原样保留。
+        self.assertEqual(P.sanitize_text(self.A), self.A)
+        self.assertFalse(P.has_fingerprint(self.A))
+
+    def test_sentence_b_alone_untouched(self):
+        self.assertEqual(P.sanitize_text(self.B), self.B)
+        self.assertFalse(P.has_fingerprint(self.B))
+
+    def test_case_insensitive_and_idempotent(self):
+        pair = self.A + " " + self.B + self.TAIL
+        out = P.sanitize_text(pair.upper())
+        # 匹配大小写不敏感，替换文本按常量原样写出。
+        self.assertIn(self.B_REWORDED, out)
+        self.assertNotIn("RELATIVE PATHS RESOLVE FROM", out.upper())
+        self.assertEqual(P.sanitize_text(out), out)
+
+    def test_whitespace_variants_untouched(self):
+        # 上游只认单空格连续；这些形态上游放行，本端也不改写。
+        for sep in ("  ", "\t", "\n", ""):
+            text = self.A + sep + self.B
+            self.assertEqual(P.sanitize_text(text), text, repr(sep))
+
+    def test_embedded_in_real_prompt(self):
+        head = "You are a helpful assistant.\n\n"
+        out = P.sanitize_text(head + self.A + " " + self.B + self.TAIL)
+        self.assertEqual(out, head + self.A + " " + self.B_REWORDED + self.TAIL)
+
+    def test_scoped_to_system_developer_assistant(self):
+        pair = self.A + " " + self.B
+        out = P.sanitize_messages([
+            {"role": "system", "content": pair},
+            {"role": "developer", "content": pair},
+            {"role": "assistant", "content": pair},
+            {"role": "user", "content": pair},
+            {"role": "tool", "tool_call_id": "c1", "content": pair},
+        ])
+        self.assertEqual(out[0]["content"], self.A + " " + self.B_REWORDED)
+        self.assertEqual(out[1]["content"], self.A + " " + self.B_REWORDED)
+        self.assertEqual(out[2]["content"], self.A + " " + self.B_REWORDED)
+        self.assertEqual(out[3]["content"], pair)
+        self.assertEqual(out[4]["content"], pair)
+
+    def test_wire_body_carries_the_rewrite(self):
+        body = P.build_upstream_body({
+            "model": "deepseek-v4.1-flash",
+            "messages": [{"role": "system", "content": self.A + " " + self.B + self.TAIL},
+                         {"role": "user", "content": "hi"}]})
+        system = body["messages"][0]["content"]
+        self.assertIn(self.B_REWORDED, system)
+        self.assertNotIn(self.B, system)
+        self.assertIn(self.A, system)
 if __name__ == "__main__":
     unittest.main()
 
