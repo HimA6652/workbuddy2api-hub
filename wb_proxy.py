@@ -16082,6 +16082,70 @@ def pool_unavailable_detail(realm, model=None):
         return ""
     return "；各账号：%s" % "，".join(reasons)
 
+
+def pool_readiness(pool=None, realm=None):
+    """账号池的可用口径：总数、按区域、按模型。
+
+    `/health` 以前只报两个数：全池的账号数与全池的"可用"数。它们既不按区域
+    分，也不看模型级冷却——被上游按 (账号, 模型) 限额挡住的号仍算"可用"。
+    于是池子对某个模型已经空了，探针与面板还是一片绿（issue #667）。
+
+    旧的 `accounts` / `accounts_ready` 保持原义（老脚本不受影响），这里补上
+    三种口径：按区域、按模型、当前出口的可用数。模型清单取自账号自己知道的
+    那些（免费模型名单、已撞线的模型、正在冷却的模型），不额外去打上游。
+    """
+    pool = POOL if pool is None else pool
+    out = {"accounts": 0, "accounts_ready": 0, "accounts_by_realm": {},
+           "accounts_ready_by_realm": {}, "accounts_ready_current_realm": 0,
+           "models_ready": {}}
+    if pool is None:
+        return out
+    accounts = list(pool.accounts)
+    realms = []
+    for a in accounts:
+        r = getattr(a, "realm", "") or ""
+        if r not in realms:
+            realms.append(r)
+    out["accounts"] = len(accounts)
+    out["accounts_ready"] = pool.count_ready()
+    for r in realms:
+        out["accounts_by_realm"][r] = len(
+            [a for a in accounts if (getattr(a, "realm", "") or "") == r])
+        out["accounts_ready_by_realm"][r] = pool.count_ready(realm=r)
+    out["accounts_ready_current_realm"] = pool.count_ready(
+        realm=realm or CURRENT_REALM)
+    models = set()
+    for a in accounts:
+        models.update(getattr(a, "free_models", ()) or ())
+        models.update(list((getattr(a, "model_caps", {}) or {}).keys()))
+        models.update(list((getattr(a, "model_cooldowns", {}) or {}).keys()))
+    for m in sorted(models)[:50]:
+        out["models_ready"][m] = {
+            r: pool.count_ready(realm=r, model=m, refresh=False) for r in realms}
+    return out
+
+
+def key_readiness(entry, pool=None):
+    """这个 API Key 真正能用到几个号（绑定 × 区域 × 当前状态）。
+
+    `/health` 报的是全池的数：池子里有号、服务在跑，但这个 Key 绑定的号可能
+    全在冷却里——"服务正常但我的 Key 用不了"就是这么发生的（issue #667）。
+    """
+    pool = POOL if pool is None else pool
+    out = {"key_accounts_ready": 0, "key_accounts_bound": 0}
+    if pool is None or not entry:
+        return out
+    allowed = wb_settings.key_allowed_accounts(entry)
+    realm = (entry or {}).get("realm") or CURRENT_REALM
+    out["key_accounts_ready"] = pool.count_ready(
+        realm=realm, allowed=allowed, refresh=False)
+    if allowed is not None:
+        out["key_accounts_bound"] = len(allowed)
+    else:
+        out["key_accounts_bound"] = len(
+            [a for a in pool.accounts if (getattr(a, "realm", "") or "") == realm])
+    return out
+
 #: 「测试」默认用哪条模型：最便宜、任何区域都有的那条。
 TEST_MODEL_DEFAULT = "deepseek-v4.1-flash"
 #: 一键测试的并发度：每个探针都是一次真实的上游请求，别把池子打成压测。
@@ -19941,9 +20005,13 @@ class Handler(BaseHTTPRequestHandler):
             "realm": CURRENT_REALM,
             "accounts": len(POOL.accounts) if POOL else 0,
             "accounts_ready": POOL.count_ready() if POOL else 0,
-            "api_key_required": auth_required(),
             "model_queues": MODEL_QUEUE_GATE.snapshot(),
         }
+        # accounts / accounts_ready keep their old meaning (whole pool, any
+        # model); the per-realm and per-model counts say which combinations
+        # are actually servable (issue #667).
+        info.update(pool_readiness())
+        info["api_key_required"] = auth_required()
         if self._key_ok():
             info.update({
                 "uid": rep.uid if rep else None,
@@ -19952,6 +20020,7 @@ class Handler(BaseHTTPRequestHandler):
                 "credential_file": os.path.basename(rep.path) if rep and rep.path else None,
                 "expires_at": rep.expires_at if rep else None,
             })
+            info.update(key_readiness(getattr(self, "key_entry", None)))
         # 热切换之后 TCP 表里的 OwningPid 仍然是监听 socket 的创建者——那个进程
         # 早就退出了，句柄却被接管的新进程继续用着，于是面板按 OwningPid 找不到
         # 人（显示幽灵 PID 或者干脆没有 PID，"停止"也就无从下手）。回环来源才
