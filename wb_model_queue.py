@@ -129,15 +129,22 @@ class ModelQueueGate(object):
     def _probe_token(ticket):
         return ticket[1] if isinstance(ticket, tuple) and len(ticket) == 2 else False
 
-    def _retain(self):
-        if len(self.states) <= MAX_SCOPES:
-            return
+    def _retain(self, protected=None):
+        """Evict stale history, never the scope with fresh queue evidence.
+
+        Every stored state remains meaningful to its in-flight generation. When
+        all older scopes have live probes, dropping the newest short-wait Gate
+        would let its next request bypass the very 6020/6021 just observed.
+        Bound the extra live-probe history instead of losing that evidence.
+        """
+        now = self.clock()
         for key, _row in sorted(self.states.items(),
-                                key=lambda item: item[1]["until"]):
-            if key not in self.probes:
-                del self.states[key]
+                                key=lambda item: (
+                                    self._fresh(item[1], now), item[1]["until"])):
             if len(self.states) <= MAX_SCOPES:
                 break
+            if key != protected and key not in self.probes:
+                del self.states[key]
 
     def _note_locked(self, key, retry_after):
         now = self.clock()
@@ -155,7 +162,7 @@ class ModelQueueGate(object):
         # Fresh evidence invalidates every outstanding probe in this generation.
         # The next begin() will issue exactly one new lease after the new delay.
         self.probes.pop(key, None)
-        self._retain()
+        self._retain(protected=key)
         return max(1, int(round(until - now)))
 
     def note(self, scope, retry_after=None):

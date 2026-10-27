@@ -245,6 +245,38 @@ class GateTests(unittest.TestCase):
         self.assertLessEqual(len(self.gate.states), 8)
         self.assertLessEqual(len(self.gate.probes), 8)
 
+    def test_retention_never_evicts_fresh_queue_evidence(self):
+        old_max = Q.MAX_SCOPES
+        Q.MAX_SCOPES = 2
+        try:
+            for name in ("A", "B"):
+                scope = (name, "m", "p", "e")
+                self.gate.note(scope, 1)
+                self.clock.now += 1.0
+                self.assertTrue(self.gate.begin(scope)[0])
+            fresh = ("new", "m", "p", "e")
+            self.gate.note(fresh, 1)
+            self.assertIn(fresh, self.gate.states)
+            self.assertEqual(self.gate.begin(fresh)[:2], (False, 1))
+        finally:
+            Q.MAX_SCOPES = old_max
+
+    def test_retention_prefers_expired_unprobed_history(self):
+        old_max = Q.MAX_SCOPES
+        Q.MAX_SCOPES = 2
+        try:
+            expired = ("expired", "m", "p", "e")
+            active = ("active", "m", "p", "e")
+            self.gate.note(expired, 1)
+            self.gate.note(active, 60)
+            self.clock.now = 2.0
+            self.gate.note(("fresh", "m", "p", "e"), 60)
+            self.assertNotIn(expired, self.gate.states)
+            self.assertIn(active, self.gate.states)
+            self.assertLessEqual(len(self.gate.states), 2)
+        finally:
+            Q.MAX_SCOPES = old_max
+
 
 class RouteTests(unittest.TestCase):
     def setUp(self):
