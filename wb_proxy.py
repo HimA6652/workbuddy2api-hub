@@ -954,6 +954,29 @@ def _persist_usage(row, fail_label):
     except Exception as exc:
         log("%s: %s" % (fail_label, exc))
 
+def upstream_failure_response(handler, model, exc, t_start, key_id=None):
+    """一次上游失败的统一出口：先定状态码，再落盘，最后回客户端。
+
+    池空（no usable account）是 **503**——等上游配额恢复，或者去面板加号；
+    其余是 **502**——查上游链路。顺序不能反：先记 502 再把响应改成 503，会
+    让日志与 `usage/usage.jsonl` 把"该等"记成"该查"，按状态码统计 5xx 时
+    两者混在一起（issue #666）。
+
+    两条链路（`/v1/responses`、`/v1/chat/completions`）原本各写一遍同样的
+    判断；收到这里后，状态码只有一个决定点，用量行与客户端看到的是同一个。
+    """
+    message = str(exc)
+    status = 503 if message.startswith("no usable account") else 502
+    record_error(model, status, message,
+                 elapsed_ms=int((time.time() - t_start) * 1000),
+                 account=getattr(exc, "account_uid", None),
+                 key=key_id)
+    if status == 503:
+        return handler._error(503, message +
+                              " - add or enable one at the dashboard (/)")
+    return handler._error(502, "upstream unreachable: %s" % exc)
+
+
 def record_error(model, status, message, elapsed_ms=None, account=None,
                  usage=None, stream=None, ttft_ms=None, gen_ms=None, fp=None,
                  outcome="failed", key=None):
@@ -22866,15 +22889,8 @@ class Handler(BaseHTTPRequestHandler):
         except wb_model_queue.QueueWaitCancelled:
             raise
         except Exception as exc:
-            message = str(exc)
-            record_error(model, 502, message,
-                         elapsed_ms=int((time.time() - t_start) * 1000),
-                         account=getattr(exc, "account_uid", None),
-                         key=self._key_id())
-            if message.startswith("no usable account"):
-                return self._error(503, message +
-                                   " - add or enable one at the dashboard (/)")
-            return self._error(502, f"upstream unreachable: {exc}")
+            return upstream_failure_response(self, model, exc, t_start,
+                                             self._key_id())
         with upstream:
             if compaction:
                 return self._responses_compaction_response(
@@ -23620,16 +23636,10 @@ class Handler(BaseHTTPRequestHandler):
         except wb_model_queue.QueueWaitCancelled:
             raise
         except Exception as exc:
-            message = str(exc)
-            record_error(model, 502, message, elapsed_ms=int((time.time() - t_start) * 1000),
-                         account=getattr(exc, "account_uid", None),
-                         key=self._key_id())
-            if message.startswith("no usable account"):
-                # Only a genuinely empty/cooling pool is a 503. A throttled model
-                # is reported as 429 by _rate_limited above instead.
-                return self._error(503, message +
-                                   " - add or enable one at the dashboard (/)")
-            return self._error(502, f"upstream unreachable: {exc}")
+            # Only a genuinely empty/cooling pool is a 503. A throttled model
+            # is reported as 429 by _rate_limited above instead.
+            return upstream_failure_response(self, model, exc, t_start,
+                                             self._key_id())
         with upstream:
             def reopen_stream():
                 # Same account, same egress: only the TCP connection is new.
