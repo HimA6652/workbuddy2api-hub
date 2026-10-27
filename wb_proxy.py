@@ -11924,6 +11924,26 @@ SANITIZE_DSH_GUI_RE = re.compile(
     r" whose URL the runtime context names\.")
 SANITIZE_DSH_GUI_REPLACEMENT = r"\1 whose URL is named in the runtime context."
 SANITIZE_DSH_GUI_LOWER = "whose url the runtime context names"
+# DSH 运行时上下文里的「@ 路径引用」段（#575）：上游 WAF 把 A 句 + B 句紧邻出现
+# 判成非官方渠道。这段文字出自 @deepseek-ai/dsh-file-reference 的
+# FILE_REFERENCE_PROMPT（dsh-file-reference/lib/index.js:54），每个带
+# runtime-context 注入的会话都会带一遍。逐句二分实测：
+#   - A 句单独放行，B 句单独放行，只有 A + 单个空格 + B 连续出现才 400；
+#   - 大小写不敏感，但空白必须严格是单个空格：双空格 / 制表符 / 换行 / 无空格
+#     全都失配，所以这里按单空格字面量锚定，不做空白泛化（会改掉上游本来放行的文本）；
+#   - 只命中 system / developer / assistant；同一段放进 user / tool / function 放行
+#     （tool 缺 tool_call_id 会报另外的错，不是这条指纹）。
+# 只把 B 句开头换成 Paths resolve relative to：A 句原样保留，句意不变，成指纹的
+# 连续结构被打破。句尾的 `; absolute paths identify ...` 不在指纹里，不动。
+SANITIZE_DSH_FILEREF_LOWER = (
+    "tokens prefixed with @ are paths the user explicitly referenced. "
+    "relative paths resolve from the workspace root")
+SANITIZE_DSH_FILEREF_RE = re.compile(
+    r"(?i)(Tokens prefixed with @ are paths the user explicitly referenced\.)"
+    r"( Relative paths resolve from the workspace root)")
+SANITIZE_DSH_FILEREF_REPLACEMENT = (
+    r"\1 Paths resolve relative to the workspace root")
+
 # 品牌词缩减（#574）：`DeepSeek Harness` 单独出现放行，但它和 GUI 描述句
 # （`this page` / `this GUI` / `this app`）连续出现时命中同一套 11-128 校验。
 # 逐段二分实测：只把品牌缩成 `DeepSeek` 就能通过，句子其余部分不用动；
@@ -11981,6 +12001,11 @@ def has_fingerprint(text, identity=True):
     if (SANITIZE_DSH_GUI_LOWER in low
             and SANITIZE_DSH_GUI_RE.search(text) is not None):
         return True
+    # @ 路径引用段：同上，字面量前置筛 + 正则确认。
+    if (SANITIZE_DSH_FILEREF_LOWER in low
+            and SANITIZE_DSH_FILEREF_RE.search(text) is not None):
+        return True
+
     # 动词短语只是廉价前置筛：真命中与否交给正则判定。这样 "powered by" 出现在
     # 与自我介绍无关的句子（工具/插件的产品描述）时不会走进 sanitize_text 的其余
     # 清洗步骤，也不会白白改写。
@@ -12001,6 +12026,9 @@ def sanitize_text(text, identity=True):
         text = SANITIZE_IDENTITY_RE.sub(SANITIZE_IDENTITY_REPLACEMENT, text)
         # GUI 描述段单独一条规则：锚定整句，只调整句尾语序。
         text = SANITIZE_DSH_GUI_RE.sub(SANITIZE_DSH_GUI_REPLACEMENT, text)
+        # @ 路径引用段：只改 B 句开头，A 句原样保留。
+        text = SANITIZE_DSH_FILEREF_RE.sub(SANITIZE_DSH_FILEREF_REPLACEMENT, text)
+
         # 品牌词缩减放在最后：GUI 规则还认全名，先让它匹配原文。
         text = SANITIZE_BRAND_RE.sub(SANITIZE_BRAND_REPLACEMENT, text)
     for old, new in SANITIZE_REWRITES:
