@@ -370,16 +370,16 @@ class TravelVisibilityTests(Base):
         import wb_accounts
         account = wb_accounts.Account({
             "uid": "uid-travel", "realm": "cn", "enabled": True,
-            "lastCheckin": "2026-10-26 19:36:23",
+            "lastCheckin": time.strftime("%Y-%m-%d") + " 19:36:23",
             "lastCheckinState": "already",
-            "lastCheckinAt": "2026-10-26 20:24:08",
+            "lastCheckinAt": time.strftime("%Y-%m-%d") + " 20:24:08",
             "checkinAttempts": 3,
         })
         row = account.public()
         self.assertEqual(row.get("lastCheckinState"), "already")
-        self.assertEqual(row.get("lastCheckinAt"), "2026-10-26 20:24:08")
+        self.assertEqual(row.get("lastCheckinAt"), time.strftime("%Y-%m-%d") + " 20:24:08")
         self.assertEqual(row.get("checkinAttempts"), 3)
-        self.assertEqual(row.get("lastCheckin"), "2026-10-26 19:36:23")
+        self.assertEqual(row.get("lastCheckin"), time.strftime("%Y-%m-%d") + " 19:36:23")
 
 
 if __name__ == "__main__":
