@@ -16909,16 +16909,64 @@ function drawSeries(){
     ctx.stroke(); ctx.globalAlpha = 1;
   }
 
-  // x 轴标签：均匀取 6 个
+  // x 轴：分钟桶显示真实分钟；跨天时带上日期，避免两个相同 HH:mm。
+  // 标签宽度同时参与数量规划和边缘夹取，窄屏宁可少几个刻度，也不互相压住。
+  function seriesTickLabel(at, step, crossesDay){
+    const d = new Date(at * 1000);
+    const hm = String(d.getHours()).padStart(2,'0') + ':' +
+      String(d.getMinutes()).padStart(2,'0');
+    if (step >= 86400) return fmtDate(at).slice(5);
+    return crossesDay ? fmtDate(at).slice(5) + ' ' + hm : hm;
+  }
+  function seriesTickPlan(ctx, series, step, crossesDay, padL, padR, width){
+    const n = series.length;
+    if (!n) return [];
+    const iw = width - padL - padR;
+    const gap = iw / n;
+    let labels = series.map(b => seriesTickLabel(b.at, step, crossesDay));
+    // DST 秋季回拨会在同一天产生两个 01:00。只给重复出现的后一个补上日期，
+    // 不把 UTC 偏移塞进原本简洁的本地时间标签。
+    if (new Set(labels).size !== labels.length){
+      const seen = new Set();
+      labels = labels.map((label, i) => {
+        if (seen.has(label)) {
+          // 日网格跨 DST 时可能重复墙上日期；只给实际重复项补真实时刻。
+          if (step >= 86400) {
+            const d = new Date(series[i].at * 1000);
+            return label + ' ' + String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+          }
+          return fmtDate(series[i].at).slice(5) + ' ' + label;
+        }
+        seen.add(label);
+        return label;
+      });
+    }
+    // 用浏览器实际字形宽度和夹取后的中心坐标验收；不靠等宽公式猜测。
+    for (let count = Math.min(6, n); count >= 2; count--){
+      const plan = [];
+      for (let t = 0; t < count; t++){
+        const idx = count === 1 ? 0 : Math.round(t * (n - 1) / (count - 1));
+        const x = padL + gap * idx + gap / 2;
+        const half = ctx.measureText(labels[idx]).width / 2;
+        plan.push({label:labels[idx], x:Math.max(padL + half, Math.min(width - padR - half, x)), half});
+      }
+      const fits = plan.every((tick, i) => i === 0 ||
+        tick.x - tick.half >= plan[i - 1].x + plan[i - 1].half + 8);
+      const bounded = plan.every(tick => tick.x - tick.half >= padL - 0.01 &&
+        tick.x + tick.half <= width - padR + 0.01);
+      if (fits && bounded) return plan;
+    }
+    // 连首尾两个刻度都放不下时只留起始时间，不制造文字碰撞。
+    const first = labels[0], half = ctx.measureText(first).width / 2;
+    if (half * 2 > iw) return [];
+    return [{label:first, x:padL + half}];
+  }
+  // 同一本地时间的重复由 seriesTickPlan 消歧；预先判定的跨日必须覆盖整组，
+  // 不能只比较首尾而漏掉「回到同一天」的区间。
+  const crossesDay = n > 1 && new Set(series.map(b => fmtDate(b.at))).size > 1;
   ctx.fillStyle = dim2; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
-  const ticks = Math.min(6, n);
-  for (let t = 0; t < ticks; t++){
-    const idx = Math.round(t * (n - 1) / Math.max(1, ticks - 1));
-    const b = series[idx];
-    const x = padL + gap * idx + gap / 2;
-    const lbl = step >= 86400 ? fmtDate(b.at).slice(5)
-      : `${String(new Date(b.at*1000).getHours()).padStart(2,'0')}:00`;
-    ctx.fillText(lbl, Math.max(padL + 14, Math.min(W - padR - 14, x)), padT + ih + 8);
+  for (const tick of seriesTickPlan(ctx, series, step, crossesDay, padL, padR, W)){
+    ctx.fillText(tick.label, tick.x, padT + ih + 8);
   }
   ctx.textAlign = 'left';
 
