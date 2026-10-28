@@ -753,6 +753,54 @@ class RouteTests(unittest.TestCase):
             self.assertTrue(slots.acquire(blocking=False))
             slots.release()
 
+    def test_stuck_transport_bounds_lease_and_late_success_preserves_new_gate(self):
+        gate = P.MODEL_QUEUE_GATE
+        scope = Q.queue_scope(self.accounts[0], MODEL)
+        gate.note(scope, 5)
+        self.clock.now = 5
+        release = threading.Event()
+        real_wait = release.wait
+        late_response = Response()
+        def stuck_transport(req, timeout=None, proxy=None):
+            real_wait(2)
+            return late_response
+        monotonic = mock.patch.object(P.time, "monotonic", side_effect=[0.0, 100.0])
+        class InlineThread(object):
+            def __init__(self, target=None, daemon=None):
+                self.target = target
+            def start(self):
+                self.target()
+            def join(self):
+                return None
+        with monotonic, mock.patch.object(P.threading, "Thread", InlineThread), \
+             mock.patch.object(P, "upstream_timeouts", return_value=(30, 60)), \
+             mock.patch.object(threading.Event, "wait", return_value=False), \
+             mock.patch.object(wb_accounts, "urlopen", side_effect=stuck_transport), \
+             mock.patch.object(gate, "success", wraps=gate.success) as success:
+            result = P.open_upstream(self.payload(), target_realm="cn")[0]
+            gate.note(scope, 5)
+            release.set()
+        self.assertIs(result, late_response)
+        self.assertEqual(gate.probes, {})
+        self.assertFalse(success.return_value is True)
+        self.assertEqual(gate.snapshot()[0]["phase"], "open")
+        result.close()
+
+    def test_slot_resume_observes_process_stop_before_its_deadline(self):
+        P._REQUEST_CANCEL.chat_slot_paused = True
+        self.addCleanup(setattr, P._REQUEST_CANCEL, "chat_slot_paused", False)
+        stop = threading.Event()
+        slots = threading.BoundedSemaphore(1)
+        slots.acquire()
+        with mock.patch.object(P, "_REQUEST_STOP", stop), \
+             mock.patch.object(P, "_client_disconnected", return_value=False), \
+             mock.patch.object(P, "_chat_slots", slots):
+            threading.Timer(0.05, stop.set).start()
+            started = time.monotonic()
+            self.assertFalse(P._resume_request_slots(1.0))
+            self.assertLess(time.monotonic() - started, 0.5)
+        slots.release()
+
     def test_cancellation_after_slot_reacquisition_never_calls_upstream(self):
         scope = Q.queue_scope(self.accounts[0], MODEL)
         exc = P.ModelQueueLimited("synthetic busy", scope=scope)
@@ -760,16 +808,22 @@ class RouteTests(unittest.TestCase):
         P._REQUEST_CANCEL.chat_slot_paused = False
         self.addCleanup(setattr, P._REQUEST_CANCEL, "state", None)
         self.addCleanup(setattr, P._REQUEST_CANCEL, "chat_slot_paused", False)
+        self.addCleanup(setattr, P._REQUEST_CANCEL, "queue_retry", None)
         slots = threading.BoundedSemaphore(1)
         self.assertTrue(slots.acquire(blocking=False))
+        cancel_checks = []
         def cancelled():
-            # Exactly the post-resume check, after a real reacquisition.
-            return P._REQUEST_CANCEL.chat_slot_paused is False
+            # The initial Gate wait has no Gate.waiters entry, so it is not a
+            # cancellation yet. Exactly the post-resume check must cancel.
+            active = P._REQUEST_CANCEL.chat_slot_paused is False
+            cancel_checks.append(active)
+            return len(cancel_checks) >= 2 and active
         with mock.patch.object(P.wb_settings, "model_queue_retry", return_value={
                 "model_queue_retry_attempts": 1,
                 "model_queue_wait_budget_seconds": 1}), \
              mock.patch.object(P.MODEL_QUEUE_GATE, "wait", return_value=True), \
              mock.patch.object(P, "_client_disconnected", side_effect=cancelled), \
+             mock.patch.object(P, "_REQUEST_STOP", threading.Event()), \
              mock.patch.object(P, "_chat_slots", slots), \
              mock.patch.object(P, "_open_upstream_attempts", side_effect=exc):
             with self.assertRaises(Q.QueueWaitCancelled):
@@ -779,6 +833,45 @@ class RouteTests(unittest.TestCase):
             P._release_request_chat_slot()
             self.assertTrue(slots.acquire(blocking=False))
             slots.release()
+
+    def test_admission_at_budget_boundary_restores_slot_without_extra_wait(self):
+        scope = Q.queue_scope(self.accounts[0], MODEL)
+        exc = P.ModelQueueLimited("synthetic busy", scope=scope, wait=8)
+        P._REQUEST_CANCEL.state = [threading.Event(), None, None]
+        P._REQUEST_CANCEL.chat_slot_paused = False
+        self.addCleanup(setattr, P._REQUEST_CANCEL, "state", None)
+        self.addCleanup(setattr, P._REQUEST_CANCEL, "chat_slot_paused", False)
+        self.addCleanup(setattr, P._REQUEST_CANCEL, "queue_retry", None)
+        slots = threading.BoundedSemaphore(1)
+        self.assertTrue(slots.acquire(blocking=False))
+        monotonic_values = iter([0.0, 0.0, 8.0, 8.0])
+        retry_state = {"started": 0.0, "retried": 0}
+        calls = []
+        def resume(timeout=None):
+            calls.append(timeout)
+            self.assertTrue(slots.acquire(timeout=timeout))
+            P._REQUEST_CANCEL.chat_slot_paused = False
+            return True
+        with mock.patch.object(P, "_queue_retry_state", return_value=retry_state), \
+             mock.patch.object(P.wb_settings, "model_queue_retry", return_value={
+                "model_queue_retry_attempts": 1,
+                "model_queue_wait_budget_seconds": 8}), \
+             mock.patch.object(P.MODEL_QUEUE_GATE, "wait", return_value=True), \
+             mock.patch.object(P.time, "monotonic", side_effect=lambda: next(monotonic_values)), \
+             mock.patch.object(P, "_client_disconnected", return_value=False), \
+             mock.patch.object(P, "_REQUEST_STOP", threading.Event()), \
+             mock.patch.object(P, "_chat_slots", slots), \
+             mock.patch.object(P, "_resume_request_slots", side_effect=resume), \
+             mock.patch.object(P, "_open_upstream_attempts", side_effect=exc):
+            with self.assertRaises(P.ModelQueueLimited):
+                P.open_upstream(self.payload(), target_realm="cn")
+        self.assertEqual(calls, [0.0])
+        self.assertEqual(retry_state["retried"], 1)
+        self.assertFalse(P._REQUEST_CANCEL.chat_slot_paused)
+        with mock.patch.object(P, "_chat_slots", slots):
+            P._release_request_chat_slot()
+        self.assertTrue(slots.acquire(blocking=False))
+        slots.release()
 
     def test_slot_restoration_is_bounded_and_does_not_mask_queue_error(self):
         scope = Q.queue_scope(self.accounts[0], MODEL)

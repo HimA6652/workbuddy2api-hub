@@ -5980,10 +5980,20 @@ def _resume_request_slots(timeout=None):
     finally still releases exactly one slot whether or not reacquisition wins.
     """
     seconds = CHAT_SLOT_WAIT_SECONDS if timeout is None else max(0.0, float(timeout))
-    acquired = _chat_slots.acquire(timeout=seconds)
-    if acquired:
-        _REQUEST_CANCEL.chat_slot_paused = False
-    return acquired
+    # threading.Semaphore has no notify/wake API. Keep its exact acquire/release
+    # ownership, but poll in short slices so hot-swap draining and disconnects
+    # are not held up by a saturated global chat-slot budget.
+    deadline = time.monotonic() + seconds
+    while True:
+        if _REQUEST_STOP.is_set() or _client_disconnected():
+            return False
+        remaining = deadline - time.monotonic()
+        acquired = _chat_slots.acquire(timeout=min(0.2, max(0.0, remaining)))
+        if acquired:
+            _REQUEST_CANCEL.chat_slot_paused = False
+            return True
+        if remaining <= 0:
+            return False
 
 
 def pinned_ref():
@@ -14947,11 +14957,13 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             admitted = MODEL_QUEUE_GATE.wait(exc.queue_scope, remaining,
                                               cancelled=_client_disconnected)
             # Gate admission and semaphore reacquisition share the original
-            # request budget. Neither becomes a new unbounded wait.
+            # request budget. A wake at the exact deadline still won admission:
+            # restore the local slot immediately rather than waiting another
+            # 30s or rejecting a retry that fits its configured 8s hint.
             remaining = float(budget) - (time.monotonic() - queue_retry["started"])
             if _REQUEST_STOP.is_set() or _client_disconnected():
                 raise wb_model_queue.QueueWaitCancelled()
-            resumed = remaining > 0 and _resume_request_slots(remaining)
+            resumed = _resume_request_slots(0.0 if admitted else remaining)
             if _REQUEST_STOP.is_set() or _client_disconnected():
                 # Cancellation can race the bounded slot reacquisition. Check
                 # again after it returns: a reacquired slot is returned by the
@@ -15411,7 +15423,15 @@ def _open_upstream_attempts(payload, session_key=None, target_realm=None, prebui
 
             transport = threading.Thread(target=await_headers, daemon=True)
             transport.start()
+            # socket timeout does not bound a resolver stuck outside the socket.
+            # Preserve the existing header-timeout behavior while bounding the
+            # recovery lease: late success may still serve this caller, but must
+            # not erase a newer probe or close a newer congestion generation.
+            transport_deadline = time.monotonic() + max(60.0, 3 * float(header_timeout))
             while not transport_done.wait(min(30.0, float(header_timeout) / 2)):
+                if time.monotonic() >= transport_deadline:
+                    MODEL_QUEUE_GATE.abandon(queue_scope, queue_token)
+                    break
                 MODEL_QUEUE_GATE.heartbeat(queue_scope, queue_token,
                                            max(180.0, float(header_timeout) + 30.0))
             transport.join()

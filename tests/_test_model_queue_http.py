@@ -21,6 +21,23 @@ P = H.P
 PASS = FAIL = 0
 
 
+def drain_slot_cleanup(semaphore, label):
+    """Wait for the server finally, not merely the client response body.
+
+    HTTPConnection.getresponse() returns after headers and read() after the
+    body, while do_POST still owns its finally. Replacing a global semaphore
+    before that finally runs is a fixture race, not a product over-release.
+    """
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if semaphore.acquire(blocking=False):
+            semaphore.release()
+            return True
+        time.sleep(0.005)
+    check(label, False, "server chat-slot cleanup did not finish within 10s")
+    return False
+
+
 def check(label, ok, detail=""):
     global PASS, FAIL
     if ok:
@@ -412,8 +429,10 @@ try:
               not held_client.is_alive() and len(healthy_result) == 2
               and healthy_result[1][0] == 429, healthy_result)
     finally:
-        if held_client is not None: held_client.join(1)
-        P._chat_slots = old_slots
+        if held_client is not None:
+            held_client.join(15)
+        if drain_slot_cleanup(P._chat_slots, "[8] fixture joined server slot cleanup"):
+            P._chat_slots = old_slots
         H.MOCK["hold"] = False
         hold_release.set()
 
@@ -466,18 +485,21 @@ try:
             # request then over-released and failed in the server thread.
             code, _, _ = call("/v1/chat/completions")
             check("second keep-alive request is a local queue rejection", code == 429, code)
+            check("second keep-alive server cleanup completes before the next request",
+                  drain_slot_cleanup(P._chat_slots, "second keep-alive cleanup"))
             P.MODEL_QUEUE_GATE.clear()
             H.MOCK["status"] = 200
             code, _, _ = call("/v1/chat/completions")
             check("third keep-alive request succeeds and releases its own slot",
-                  code == 200 and P._chat_slots.acquire(blocking=False), code)
-            P._chat_slots.release()
+                  code == 200 and drain_slot_cleanup(P._chat_slots, "third keep-alive cleanup"), code)
         finally:
             H.request = original_request
     finally:
         if connection is not None: connection.close()
-        if held_client is not None: held_client.join(1)
-        P._chat_slots = old_slots
+        if held_client is not None:
+            held_client.join(15)
+        if drain_slot_cleanup(P._chat_slots, "[9] fixture joined server slot cleanup"):
+            P._chat_slots = old_slots
 
     print("[10] mixed-product exhaustion retains queue semantics on every API")
     reset()
