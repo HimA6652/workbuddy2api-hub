@@ -118,8 +118,9 @@ class TimeseriesTests(unittest.TestCase):
     def test_daily_buckets_follow_calendar_days_across_dst(self):
         """日桶按本地日界而不是固定 86400 秒；23/25 小时日两侧不串日。
 
-        子进程切换 TZ 后重建日期与缓存状态。对扫描、缓存启用/禁用以及
-        缓存复用都断言同一结果，防止只修显示却继续把记录折进错误日期。
+        子进程用 zoneinfo 显式转换墙上时间，兼容 Windows 不识别 TZ 的行为。
+        对扫描、缓存启用/禁用以及缓存复用都断言同一结果，并验证整数窗口
+        仍输出整数时间戳，防止只修显示却继续把记录折进错误日期。
         """
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         for zone in ("America/New_York", "Europe/Berlin", "Australia/Lord_Howe"):

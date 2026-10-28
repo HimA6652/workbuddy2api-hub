@@ -4931,6 +4931,8 @@ def _usage_timeseries_scan(realm, lo, hi, step):
                     # 否则切换日之后的行会落回前一天，和 _local_day_key 的
                     # 存量日桶也不一致。保持 at 的类型与 lo 相同（见上）。
                     bucket_at = _local_midnight(at)
+                    if isinstance(lo, int):
+                        bucket_at = int(bucket_at)
                     lt = time.localtime(at)
                     key = (lt.tm_year, lt.tm_mon, lt.tm_mday)
                 else:
