@@ -22,7 +22,7 @@
 This project is for protocol research and personal use only. Prefer the official client, do not use your primary account, and do not resell or share access.
 
 <p align="center">
-  <a href="https://github.com/HimA6652/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v1.10.0-2496ED?style=flat-square" alt="Version 1.10.0"></a>
+  <a href="https://github.com/HimA6652/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v1.10.1-2496ED?style=flat-square" alt="Version 1.10.1"></a>
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-Intl_&_CN-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -510,6 +510,7 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 
 下一版的改动记在这里；完整历史见 **[docs/CHANGELOG.md](docs/CHANGELOG.md)**。
 
+- **v1.10.1**：模型公共队列新增默认关闭的有界重试，6020 按上游 `retry_after` 秒数等待、6021 有界退避；客户端断开、热切换和预算耗尽均明确退出，失败保留原始 429。积分历史与看板共用同一时间区间，时序图横轴保留分钟并正确处理本地日界；修复重试边界与慢响应探针租约。完整变更与验证见 **[docs/CHANGELOG.md](docs/CHANGELOG.md#v1101)**。
 - **v1.10.0**：每日活跃遇到账号风控时按账号停手，签到支持并发、失败重试、任务计划与全局开关；调度进度跨重启保留，整点漏跑与热切换 PID 归属修复。模型入口的 `6020 / 6021` 队列错误按模型、产品和出口共享退避，单飞半开恢复，不再逐账号冷却和扫池。另修复面板设置与套餐筛选，以及模型目录缓存连续性。完整变更、实测数字与回滚方式见 **[docs/CHANGELOG.md](docs/CHANGELOG.md#v1100)**。
 - **v1.9.0 发布**：面板加载性能与零中断热更新。账号表改增量渲染、轮询 15 秒→60 秒；`/accounts` 载荷瘦身并把积分扫描转后台；看板与 API 响应启用 gzip；`wb_proxy` 新增 `/hotswap`，改完代码把监听句柄交给新进程，在途请求排空后再退出。完整变更、实测数字与回滚方式见 **[docs/CHANGELOG.md](https://github.com/HimA6652/workbuddy2api-hub/blob/main/docs/CHANGELOG.md#v190)**。
 - **v1.8.0 发布**：汇总 v1.7.33 之后的 #640、#642、#643、#645/#647，并补齐 #578、#618、#625 的发布记录。完整变更、验证范围与已知限制见 **[docs/CHANGELOG.md](https://github.com/HimA6652/workbuddy2api-hub/blob/main/docs/CHANGELOG.md#v180)**；下一版的改动继续写在本段。
@@ -604,7 +605,7 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 - **DSH 一键配置放宽限流重试，修掉「对话到一半链接中断」**：WorkBuddy 的 429 冷却通常约一分钟，而 DSH 的默认 `retryPolicy` 是 `normal` / 最多 5 次 / 退避 500ms 起翻倍、封顶 10s——加起来不到 16 秒就放弃，冷却还没结束回合就以 `RATE_LIMIT` 失败。一键配置现在给 `wb-proxy` 单独写 `retryPolicy: {mode: normal, maxRetries: 8, backoff: {initialDelayMs: 2000, maxDelayMs: 30000, jitterRatio: 0.1}}`（合计约 2 分半），只影响 `wb-proxy`，其它 provider 仍用默认策略；字段与取值按 `@deepseek-ai/dsh-llm` 的 `RetryPolicySchema`。已经接入过的机器重新点一次「一键配置」即可补上这段（幂等），重启 DSH 生效。
   DSH's default per-provider retry policy (normal, at most 5 retries, 500ms→10s backoff, under 16 seconds in total) gives up before WorkBuddy's ~60s rate-limit cooldown ends, so the turn dies with `RATE_LIMIT` — which the user sees as the conversation breaking mid-flight. The one-click config now writes a wider `retryPolicy` for `wb-proxy` only (8 retries, 2s initial delay, 30s cap, ~2.5 minutes in total); other providers keep the default policy. Field names and bounds follow `@deepseek-ai/dsh-llm`'s `RetryPolicySchema`. Re-running the one-click config on an already-integrated machine adds it idempotently, and a DSH restart applies it.
 
-已发布版本的完整记录（v1.4.5 ~ v1.10.0，含每版的 PR 归属）见 **[docs/CHANGELOG.md](https://github.com/HimA6652/workbuddy2api-hub/blob/main/docs/CHANGELOG.md)**。
+已发布版本的完整记录（v1.4.5 ~ v1.10.1，含每版的 PR 归属）见 **[docs/CHANGELOG.md](https://github.com/HimA6652/workbuddy2api-hub/blob/main/docs/CHANGELOG.md)**。
 
 ## 七、致谢与引用声明 (Credits & References)
 
