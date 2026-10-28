@@ -123,9 +123,15 @@ class TimeseriesTests(unittest.TestCase):
         仍输出整数时间戳，防止只修显示却继续把记录折进错误日期。
         """
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        zones = os.path.join(root, "tests", "tzdata")
+        # Windows CPython has no system IANA database and setup-python does
+        # not install the optional tzdata package. These public-domain zone
+        # files make this a real DST test instead of a platform-dependent skip.
+        self.assertTrue(os.path.isfile(os.path.join(
+            zones, "America", "New_York")), "hermetic IANA test fixture missing")
         for zone in ("America/New_York", "Europe/Berlin", "Australia/Lord_Howe"):
             with self.subTest(zone=zone):
-                env = dict(os.environ, PYTHONUTF8="1", TZ=zone)
+                env = dict(os.environ, PYTHONUTF8="1", PYTHONTZPATH=zones, TZ=zone)
                 result = subprocess.run(
                     [sys.executable, os.path.join(root, "tests",
                                                  "_usage_calendar_days_probe.py"), zone],
