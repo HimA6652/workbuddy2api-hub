@@ -393,8 +393,5 @@ class TravelVisibilityTests(Base):
         })
         self.assertEqual(stale.public().get("checkinAttempts"), 0)
 
-
 if __name__ == "__main__":
     unittest.main(verbosity=2)
-
-

@@ -74,7 +74,7 @@ git push origin main
 ```
 
 - 用 **merge** 而不是 rebase：`main` 已经推到 origin，rebase 会让历史与远端分叉、必须强推。
-- 冲突高发区只有 `wb_proxy.py` / `dashboard.html` 两个大文件，本地改动各 13-14 行。
+- 冲突高发区是 `wb_proxy.py` / `wb_scheduler.py` / `dashboard.html` 等持续演进的大文件；`wb_proxy.py` 和 `dashboard.html` 还包括队列 Gate、面板等 fork 功能。不要以固定行数判断冲突，以合并结果和完整门禁为准。
 - 合并后跑一遍 §3 的门禁再推。
 
 真要把某个改动回馈上游时，临时开一条一次性分支、`git rebase upstream/main`、单独开 PR，
@@ -197,7 +197,11 @@ WB_UPDATE_REPO=someone/workbuddy2api-hub
 2. 回退路径 `GET https://github.com/<repo>/releases/latest` 的 302 `Location` 末尾取 tag（走网页流量，不吃 API 配额）；
 3. 单次 10s 超时、24 小时节流、失败下个窗口重试；凭据只从 `GITHUB_TOKEN` 环境变量读，绝不落盘。
 
-### 8.2 首次启用前必须先发一个 Release
+### 8.2 Release 历史与发布流程
+
+当前流程：先推 `main` 并确认同一提交的完整测试矩阵通过，再推 `vX.Y.Z` 标签。Release 工作流校验源码与 OpenWrt 版本，构建附件并创建 **Draft Release**；补齐版本说明并发布后，`release-checksums.yml` 会生成 `checksums.txt`。当前已发布 `v1.9.0`，本次发布目标是 `v1.10.0`。
+
+以下为 **2026-10-26 首次启用更新检查时**的历史记录（当时还没有任何 Release，现已过时，只用于解释空列表的处理逻辑）：
 
 2026-10-26 实测本仓库还没有 Release：
 
@@ -226,13 +230,8 @@ UpdateChecker.check()     -> {"current_version":"1.8.0","latest_version":null,"l
 `update_check_enabled = true`）。下一次启动检查会把它覆盖成空值，于是面板从「已是最新」
 退成「尚未检查」。发一个 Release 即可：
 
-1. 仓库主页 → 右侧 **Releases** → **Draft a new release**；
-2. **Choose a tag** 选已存在的 `v1.8.0`（或新建 `v1.8.1`）；
-3. 标题填 `v1.8.0`，说明写本次自用改动要点 → **Publish release**。
-
-发布后同一接口返回该条记录，面板显示「最新版本 v1.8.0 / 已是最新」。
-注意 `v1.8.0` 这个 tag 在本地与远端都已存在（89 个 tag 一并推过），
-所以「新建 tag」不是必需动作，**发布 Release 记录**才是。
+当时手动创建首个 Release 后，同一接口返回该条记录，面板可以显示最新版本与更新状态。
+现在使用本节开头的 `main` → 完整矩阵 → 标签 → Draft → 发布流程；发布的是 **Release 记录**，不是只创建 tag。
 
 ### 8.3 版本号约定（供以后比较）
 
