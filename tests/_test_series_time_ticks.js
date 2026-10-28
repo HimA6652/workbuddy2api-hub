@@ -51,8 +51,9 @@ function assertReadable(labels,width){
  }
 }
 if(process.env.UI04_DST_CASE==='1'){
- const daily=draw(makeSeries(localAt(2026,11,1,0,0),3,86400),86400,1200);
- check('DST 日序列仅重复日期补真实时刻',daily.map(x=>x.text).join(',')==='11-01,11-01 23:00,11-02',JSON.stringify(daily));
+ const daily=draw([1,2,3].map(day=>({at:localAt(2026,11,day,0,0),total_tokens:day,
+  completion_tokens:day,requests:1,errors:0,credit:0})),86400,1200);
+ check('DST 日序列按真实日界且显示真实日期',daily.map(x=>x.text).join(',')==='11-01,11-02,11-03',JSON.stringify(daily));
  assertReadable(daily,1200);
  const labels=draw(makeSeries(Date.UTC(2026,10,1,5,0)/1000,4,3600),3600,1200);
  check('DST 回拨重复小时带日期消歧',labels.length===4&&labels[0].text==='01:00'&&labels[1].text==='11-01 01:00'&&labels[2].text==='02:00'&&labels[3].text==='03:00',JSON.stringify(labels));

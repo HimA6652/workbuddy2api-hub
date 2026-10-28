@@ -4873,8 +4873,8 @@ def _line_outside_window_bytes(raw, lo, hi):
 def _usage_timeseries_scan(realm, lo, hi, step):
     """One uncached pass over the log, folding rows into fixed-width buckets.
 
-    这是窗口序列的兜底路径：日/小时桶切片不成立（见 _series_slice）时用它，
-    口径一字未改。
+    这是窗口序列的兜底路径：日/小时桶切片不成立（见 _series_slice）时用它。
+    分钟/小时仍按固定秒网格；日桶按本地日界切分，避免 DST 日错归。
     """
     buckets = {}
     # 网格原点：日/小时/分钟桶按本地墙上时间对齐（与日桶/小时桶切片同一
@@ -4925,9 +4925,19 @@ def _usage_timeseries_scan(realm, lo, hi, step):
                 at = row.get("at") or 0
                 if at < lo or at > hi:
                     continue
-                key = int((at - origin) // step)
+                if step == 86400:
+                    # 一天不总是 86400 秒：DST 切换日可能是 23/25 小时。
+                    # 日桶按真实本地日界切分，不能从首个午夜一直加固定秒数，
+                    # 否则切换日之后的行会落回前一天，和 _local_day_key 的
+                    # 存量日桶也不一致。保持 at 的类型与 lo 相同（见上）。
+                    bucket_at = _local_midnight(at)
+                    lt = time.localtime(at)
+                    key = (lt.tm_year, lt.tm_mon, lt.tm_mday)
+                else:
+                    key = int((at - origin) // step)
+                    bucket_at = origin + key * step
                 bucket = buckets.setdefault(key, {
-                    "at": origin + key * step, "requests": 0, "errors": 0,
+                    "at": bucket_at, "requests": 0, "errors": 0,
                     "prompt_tokens": 0, "completion_tokens": 0,
                     "reasoning_tokens": 0, "cached_tokens": 0,
                     "total_tokens": 0, "credit": 0.0,

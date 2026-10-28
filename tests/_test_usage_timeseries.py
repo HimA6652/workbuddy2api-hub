@@ -5,6 +5,7 @@ No upstream credentials or outbound network are used.
 """
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -113,6 +114,24 @@ class TimeseriesTests(unittest.TestCase):
             by_day[key] = by_day.get(key, 0) + b["requests"]
         self.assertEqual(by_day.get(wb_proxy._local_day_key(yest0)), 10)
         self.assertEqual(by_day.get(wb_proxy._local_day_key(today0)), 5)
+
+    def test_daily_buckets_follow_calendar_days_across_dst(self):
+        """日桶按本地日界而不是固定 86400 秒；23/25 小时日两侧不串日。
+
+        子进程切换 TZ 后重建日期与缓存状态。对扫描、缓存启用/禁用以及
+        缓存复用都断言同一结果，防止只修显示却继续把记录折进错误日期。
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for zone in ("America/New_York", "Europe/Berlin", "Australia/Lord_Howe"):
+            with self.subTest(zone=zone):
+                env = dict(os.environ, PYTHONUTF8="1", TZ=zone)
+                result = subprocess.run(
+                    [sys.executable, os.path.join(root, "tests",
+                                                 "_usage_calendar_days_probe.py"), zone],
+                    cwd=root, env=env, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0,
+                                 result.stdout + "\n" + result.stderr)
+                self.assertIn("calendar-day buckets OK", result.stdout)
 
     def test_custom_window_hour_and_minute_buckets_align_to_wall_clock(self):
         """非整点 / 非整分的 since：小时桶、分钟桶同样要对齐本地墙上时间
