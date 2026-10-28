@@ -175,6 +175,24 @@ function makeElement(tag, options) {
 
   for (const name of ELEMENT_METHODS) el[name] = NOOP;
 
+  // Canvas is a real part of the dashboard now that the shared analytics loader
+  // also paints the legacy series chart. Keep DOM reads strict, but model the
+  // open-ended 2D drawing surface with no-op methods and real return shapes.
+  if (el.tagName === 'CANVAS') {
+    const context = new Proxy({}, {
+      get(target, prop) {
+        if (prop in target) return target[prop];
+        if (prop === 'measureText') return text => ({width: String(text).length * 6});
+        if (prop === 'createLinearGradient' || prop === 'createRadialGradient') {
+          return () => ({addColorStop: NOOP});
+        }
+        return NOOP;
+      },
+      set(target, prop, value) { target[prop] = value; return true; },
+    });
+    el.getContext = kind => kind === '2d' ? context : null;
+  }
+
   // 元素对外的身份是最后返回的那个 Proxy；appendChild 挂 parentNode 时也必须用
   // 同一个身份。否则 panel 沿 parentNode 上溯看到的"祖先"与 childNodes 里的子
   // 节点不是同一个对象，按元素做的缓存（WeakMap 键）会整条链失效——真 DOM 里
@@ -321,8 +339,11 @@ function installDom(options) {
     activeElement: null,
     getElementById: (id) => {
       if (!byIdMap.has(id)) {
-        const el = makeElement('div', { unknown, permissive: opts.permissive });
+        const canvasIds = new Set(['seriesCanvas', 'usageSeriesChart', 'sparkTokens',
+          'sparkReqs', 'sparkSpeed', 'sparkCache', 'sparkCost']);
+        const el = makeElement(canvasIds.has(id) ? 'canvas' : 'div', { unknown, permissive: opts.permissive });
         el.id = id;
+        if (el.tagName === 'CANVAS') el.parentElement = document.body;
         byIdMap.set(id, el);
       }
       return byIdMap.get(id);

@@ -83,7 +83,8 @@ dom.installDom({
       if(body.realm) realmState.current = body.realm;
     }
     const payload = {current: realmState.current, accounts: [], slots: [], data: [],
-                     results: [], byAccount: [], models: [], rows: [], total: 0};
+                     results: [], byAccount: [], models: [], rows: [], total: 0,
+                     summary: {window: {}, all_time: {}}, series: []};
     return Promise.resolve({
       status: 200, ok: true,
       json: () => Promise.resolve(payload),

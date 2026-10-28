@@ -38,7 +38,7 @@ const answer = body => Promise.resolve({
 });
 const payload = extra => Object.assign(
   {current: realmReply, accounts: [], slots: [], data: [], results: [],
-   byAccount: []}, extra);
+   byAccount: [], summary: {window: {}, all_time: {}}, series: []}, extra);
 
 dom.installDom({
   fetch: url => {

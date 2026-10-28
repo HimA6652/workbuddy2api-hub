@@ -946,6 +946,9 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
 }
 #pageAnalytics .seg button:hover{color:var(--fg)}
 #pageAnalytics .seg button.on{background:var(--panel);color:var(--fg);font-weight:600;box-shadow:var(--shadow);border:1px solid var(--line)}
+#pageAnalytics #rangeCustomBox{display:none;align-items:center;flex-wrap:wrap;gap:6px;color:var(--dim);font-size:12px}
+#pageAnalytics #rangeCustomBox label{display:flex;align-items:center;gap:4px}
+#pageAnalytics #rangeCustomBox input{border:1px solid var(--line);background:var(--panel2);color:var(--fg);padding:4px 6px;font:12px var(--sans);border-radius:7px}
 
 
 #pageAnalytics .kpis{display:grid;grid-template-columns:repeat(6, 1fr);gap:8px;margin-bottom:10px}
@@ -4422,6 +4425,11 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       <button data-range="month">本月</button>
       <button data-range="d30">近 30 天</button>
       <button data-range="all">全部</button>
+      <button data-range="custom">自定义</button>
+    </div>
+    <div id="rangeCustomBox">
+      <label>从 <input type="datetime-local" id="rangeCustomSince" onchange="onRangeCustomChange()"></label>
+      <label>到 <input type="datetime-local" id="rangeCustomUntil" onchange="onRangeCustomChange()"></label>
     </div>
   </div>
 
@@ -7933,7 +7941,7 @@ async function getJSON(url, opts){
   // （前者允许浏览器回 304 复用副本），合并会让其中一方悄悄拿到不该拿的副本。
   const key = cache + ' ' + url;
   const hit = GETJSON_INFLIGHT.get(key);
-  if(hit && (Date.now() - hit.at) < GETJSON_STALE_MS) return hit.p;
+  if(!(opts && opts.force) && hit && (Date.now() - hit.at) < GETJSON_STALE_MS) return hit.p;
   const run = async () => {
     const r = await fetch(url, {cache: cache, headers: authHeaders()});
     if(r.status === 401 || r.status === 403){ panelSessionLost(); throw new Error('unauthorized'); }
@@ -15293,25 +15301,6 @@ async function clearServerLogs(){
  * 只有「今日 / 全部历史」时，一次 /usage/analytics 同时带回两个桶，切换按钮
  * 重渲染缓存就够了；窗口变多之后一个 payload 装不下所有窗口，继续重渲染缓存
  * 只会把上一个窗口的数字挂到新标签下面，所以一律重取。 */
-function setAnalyticsRange(range){
-  analyticsRange = range;
-  const btns = {today:'btnRangeToday', week:'btnRangeWeek', month:'btnRangeMonth',
-                all:'btnRangeAll', custom:'btnRangeCustom'};
-  Object.keys(btns).forEach(k => {
-    const b = document.getElementById(btns[k]);
-    if(b) b.classList.toggle('active', k === range);
-  });
-  const box = document.getElementById('rangeCustomBox');
-  if(box) box.style.display = (range === 'custom') ? 'inline-flex' : 'none';
-  if(range === 'custom') prefillCustomRange();
-  loadAnalytics();
-  // The model matrix reads /usage and /usage/perf directly, so it has to be
-  // refetched: without this the table kept showing all-time figures while the
-  // page said "today", which is the inconsistency the range buttons were
-  // meant to remove.
-  loadAnalyticsMatrix();
-}
-
 /* 自定义区间的输入框初始为空，而空 = 不限，画面会和「全部历史」一模一样，看起来
  * 像按钮坏了。第一次点开时把起点填成今天零点：一个能看懂的默认窗口，操作者再自己
  * 放宽或收窄；终点留空表示「到现在」。 */
@@ -15345,19 +15334,9 @@ function onRangeCustomChange(){
   loadAnalyticsMatrix();
 }
 
-/* 三个取数端点共用同一个查询串，避免 /usage 与 /usage/perf 各拼一份而漏掉自定义
- * 区间——那正是「卡片与表格口径不一致」的复发路径。 */
+/* 积分历史与主看板共用同一套区间推导；手动刷新不会再退回今日。 */
 function analyticsQuery(){
-  let q = '?realm=all&range=' + encodeURIComponent(analyticsRange || 'today');
-  if(analyticsRange === 'custom'){
-    const sEl = document.getElementById('rangeCustomSince');
-    const uEl = document.getElementById('rangeCustomUntil');
-    const s = fromLocalInputValue(sEl ? sEl.value : '');
-    const u = fromLocalInputValue(uEl ? uEl.value : '');
-    if(s !== null) q += '&since=' + s;
-    if(u !== null) q += '&until=' + u;
-  }
-  return q;
+  return '?realm=all&' + rangeParams(typeof state !== 'undefined' ? state.range : analyticsRange);
 }
 
 /* 模型性能指标与用量一览
@@ -16029,7 +16008,7 @@ function renderUsageSeries(data){
 async function loadCreditHistory(btn){
   if(btn) btn.disabled = true;
   try{
-    const data = await getJSON('/usage/timeseries' + analyticsQuery(), POLL_READ);
+    const data = await getJSON('/usage/timeseries' + analyticsQuery(), {...POLL_READ, force:true});
     renderUsageSeries(data);
     renderCreditHistory(data);
     if(btn) toast('积分扣减历史已刷新', 'ok');
@@ -16528,7 +16507,7 @@ async function loadPrevSummary(untilAt){
   const pr = prevRange(untilAt);
   if (!pr) return null;
   try{
-    const p = await api(`/usage/timeseries?realm=all&range=custom&since=${pr[0]}&until=${pr[1]}`);
+    const p = await api(`/usage/timeseries?realm=all&range=custom&since=${pr[0]}&until=${pr[1]}&summary=1`);
     const t = (p.series || []).reduce((a, b) => ({
       tok:    a.tok    + (b.total_tokens   || 0),
       req:    a.req    + (b.requests       || 0),
@@ -16621,7 +16600,35 @@ function rangeParams(range, untilAt){
   if (range === 'd3')  return `range=custom&since=${now - 3*86400}&until=${now}`;
   if (range === 'd30') return `range=custom&since=${now - 30*86400}&until=${now}`;
   if (range === 'all') return `range=custom&since=${now - 365*86400}&until=${now}`;
+  if (range === 'custom'){
+    const s = fromLocalInputValue(($('rangeCustomSince') || {}).value || '');
+    const u = fromLocalInputValue(($('rangeCustomUntil') || {}).value || '');
+    let q = 'range=custom';
+    if(s !== null) q += '&since=' + s;
+    if(u !== null) q += '&until=' + u;
+    return q;
+  }
   return `range=${range}`;
+}
+
+/* 区间状态与 B 版 state 同一词法作用域。点击、折叠和轮询共享 loadRange 的
+ * analytics/timeseries 响应；旧按钮 id 保留为兼容别名，不再另发积分历史请求。 */
+function loadRangeForOldDashboard(range){
+  analyticsRange = range;
+  state.range = range;
+  const rangeSeg = document.getElementById('rangeSeg');
+  if(rangeSeg) [...rangeSeg.children].forEach(b => b.classList.toggle('on', b.dataset.range === range));
+  const btns = {today:'btnRangeToday', week:'btnRangeWeek', month:'btnRangeMonth',
+                all:'btnRangeAll', custom:'btnRangeCustom'};
+  Object.keys(btns).forEach(k => {
+    const b = document.getElementById(btns[k]);
+    if(b) b.classList.toggle('active', k === range);
+  });
+  const box = document.getElementById('rangeCustomBox');
+  if(box) box.style.display = (range === 'custom') ? 'inline-flex' : 'none';
+  if(range === 'custom') prefillCustomRange();
+  loadAnalytics();
+  loadAnalyticsMatrix();
 }
 
 /* ============================================================
@@ -16641,6 +16648,9 @@ if(typeof MutationObserver !== 'undefined'){
 /* ============================================================
    加载与渲染
    ============================================================ */
+/* 所有看板入口最终都走这一个 loader。旧版函数名只保留为兼容别名，避免
+ * 初始化顺序或另一条轮询同时请求两套 analytics/timeseries，再用不同 range
+ * 的迟到响应覆盖积分扣减历史。 */
 /* 区间/轮询的代次。与 refreshInner 里 REFRESH_GEN 同一套理由：取数期间又发起了更新
  * 的一轮（刚切了区间、或轮询撞上点击），这批结果已经过期，直接丢掉——否则慢的那一轮
  * 晚到，会把上一个区间的数字画到新区间的标题下面（实测有 1.2~1.8 秒的错位窗口）。 */
@@ -16659,6 +16669,9 @@ async function loadRange(polled){
     if (gen !== WBA_GEN) return;
     state.analytics = analytics;
     state.series = series;
+    renderAnalytics(analytics);
+    renderUsageSeries(series);
+    renderCreditHistory(series);
     prevSummary = prev;
   } catch(e){
     if (gen !== WBA_GEN) return;
@@ -16680,7 +16693,6 @@ async function loadStatic(){
   // 剩余用量 / 积分扣减 / 积分获取历史：原版区块的数据管道原来挂在旧 loadAnalytics 上，
   // 页面换成新版后这里补回调用（展开对应折叠区时还会再刷一次）。
   try{ loadRemainingUsage(); }catch(e){}
-  try{ loadCreditHistory(); }catch(e){}
   try{ loadCreditGrants(); }catch(e){}
 }
 
@@ -17303,12 +17315,10 @@ function renderPerfFold(){
    ============================================================ */
 $('rangeSeg').addEventListener('click', ev => {
   const btn = ev.target.closest('button'); if (!btn) return;
-  [...$('rangeSeg').children].forEach(b => b.classList.toggle('on', b === btn));
-  state.range = btn.dataset.range;
   // 新区间的数字还没到：先把页头的旧读数清成占位，别让「全部」标题下面继续挂着本月的
   // 数字（那一段是页头最长的一行，误读代价最大）。取回后 renderKpis() 会重新写满。
   $('pageSub').textContent = '—';
-  loadRange();
+  setAnalyticsRange(btn.dataset.range);
 });
 $('metricSeg').addEventListener('click', ev => {
   const btn = ev.target.closest('button'); if (!btn) return;
@@ -17381,19 +17391,12 @@ window.addEventListener('resize', () => { drawSeries(); drawSparks(); });
    本页的 numSpan/data-tip 元素自动生效。 */
 try { ensureHoverTip(); } catch(e){}
 
-/* 剩余用量 / 积分扣减 / 积分获取历史：数据由原版管道（loadRemainingUsage /
-   loadCreditHistory / loadCreditGrants）画进折叠区；展开时按需再刷新一次
-   （老版是每次进入看板都拉，这里收窄到按需）。积分扣减历史要跟随本页的范围
-   选择器（旧管线的 analyticsRange 只认 today/week/month/all/custom）。 */
-function syncOldRange(){
-  const r = state.range;
-  analyticsRange = (r === 'd3' || r === 'd30') ? 'today' : r;
-}
+/* 剩余用量 / 积分获取历史在展开时再刷新。积分扣减历史直接使用主看板
+ * loadRange() 已取回的 state.series：同一次响应、同一 range、同一份数据，
+ * 切区间和 5 秒轮询都不另发请求，也不会覆盖较新的积分历史。 */
 {
   const rb = $('foldRemainBox');
   if (rb) rb.addEventListener('toggle', () => { if (rb.open) { try{ loadRemainingUsage(); }catch(e){} } });
-  const cb = $('foldCreditsBox');
-  if (cb) cb.addEventListener('toggle', () => { if (cb.open) { try{ syncOldRange(); loadCreditHistory(); }catch(e){} } });
   const gb = $('foldGrantsBox');
   if (gb) gb.addEventListener('toggle', () => { if (gb.open) { try{ loadCreditGrants(); }catch(e){} } });
 }
@@ -17408,6 +17411,16 @@ function wbaTick(){
   loadRange(true);   // 轮询：窗口上界按 15 秒桶量化，连续两轮同桶才有可能吃 304
 }
 window.loadAnalytics = wbaTick;            /* 面板 5s 轮询 / 切页 / 回前台统一入口 */
+/* B 版的 state 是 IIFE 私有变量，旧脚本只能由这一个适配入口访问它；其它
+ * 已执行脚本的词法函数绑定也在这里替换，避免留下第二套取数轮询。 */
+loadAnalytics = wbaTick;
+setAnalyticsRange = function(range){
+  analyticsRange = range;
+  loadRangeForOldDashboard(range);
+};
+/* 旧全局函数不能访问本 IIFE 的 rangeParams；手动刷新也复用同一份当前区间。 */
+analyticsQuery = function(){ return '?realm=all&' + rangeParams(state.range); };
+loadUsageSeries = function(){};              /* series 已随 loadRange 的同一份响应渲染 */
 window.loadAnalyticsMatrix = function(){}; /* 旧性能矩阵已并入本页（性能分位折叠区） */
 window.wbaLoad = wbaTick;                  /* 调试入口 */
 /* 面板每 5 秒扫描全页表格并自动接排序（applyAllTableSorts）：把本页表格登记进
