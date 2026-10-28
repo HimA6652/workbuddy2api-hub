@@ -89,7 +89,7 @@ git push origin main
 | `docs/LAN-SHARING.md` | 局域网共享网关操作手册（脱敏） |
 | `docs/PERF-NOTES.md` | 面板卡顿的根因、实测数据、改动清单与上线/回滚步骤 |
 
-## 6. 三个踩过的坑（都有实测）
+## 6. 四个踩过的坑（都有实测）
 
 1. **跑测试不要带 `ACCOUNTS_DIR`。** 带着指向真实账号目录的 `ACCOUNTS_DIR` 跑
    `tests/run_all.py`，`_test_agents.py` 的 `opencode models populated from catalog fallback`
@@ -101,6 +101,11 @@ git push origin main
 3. **面板配置只在启动时读一次。** `CFG = load_config()` 在导入期执行，改完
    `panel/config.json`（端口、`python_exe`、`lan`）必须重启面板进程才生效。
    另外 `panel/config.json` 里有本机面板密码，已进 `.gitignore`，不要提交。
+4. **测试夹具里别把「今天」写死。** 凡是喂给 `checkinAttempts` / `lastCheckinAt` 这类
+   按天归一的字段，日期要 `time.strftime("%Y-%m-%d")` 现取。10-27 凌晨全套门禁出现
+   `237 passed / 1 failed`，唯一挂的就是 `_test_checkin_batch` 把 `lastCheckinAt` 写成
+   了 `2026-10-26`——一夜之后 `checkin_attempts_value()` 把它当成昨天的记录归零，
+   断言 `0 != 3`。代码没坏，夹具过期了。
 
 ## 7. 自己用模式（不提 PR 也完全可行）
 

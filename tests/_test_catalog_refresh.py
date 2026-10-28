@@ -450,5 +450,95 @@ class CatalogDiskDumpTests(unittest.TestCase):
         P.persist_remote_catalog("cn", config_payload(["glm-5.3"]))   # 不抛
 
 
+class CatalogContinuityTests(unittest.TestCase):
+    """目录刷新只接受真实下架，不能把回退身份或瞬时失败当成下架。"""
+
+    def setUp(self):
+        self._orig = (P.POOL, P.wb_accounts.urlopen, P.wb_tiers.ingest,
+                      P.persist_remote_catalog)
+        self._good = dict(P._CATALOG_LAST_GOOD)
+        self._pending = dict(P._CATALOG_PENDING_LOSS)
+        P.POOL = _FakePool()
+        P._CATALOG_LAST_GOOD.clear()
+        P._CATALOG_PENDING_LOSS.clear()
+        P.wb_tiers.ingest = lambda *args: None
+        P.persist_remote_catalog = lambda *args: None
+
+    def tearDown(self):
+        P.POOL, P.wb_accounts.urlopen, P.wb_tiers.ingest, P.persist_remote_catalog = self._orig
+        P._CATALOG_LAST_GOOD.clear()
+        P._CATALOG_LAST_GOOD.update(self._good)
+        P._CATALOG_PENDING_LOSS.clear()
+        P._CATALOG_PENDING_LOSS.update(self._pending)
+
+    def answer(self, desktop=None, fallback=None):
+        cfg = P.wb_accounts.get_realm_config("cn")
+        desktop_ua = cfg["chat_ua"]
+        def fake(req, timeout=10, proxy=None):
+            ua = req.get_header("User-agent", "")
+            if ua == desktop_ua:
+                payload = desktop
+            else:
+                payload = fallback
+            if payload is None:
+                raise OSError("synthetic catalog failure")
+            return _FakeResponse(config_payload(payload))
+        P.wb_accounts.urlopen = fake
+
+    def test_fallback_ua_cannot_drop_models_from_last_good(self):
+        self.answer(desktop=["glm-5.3", "deepseek-v4.1-flash"])
+        P.fetch_remote_product_config("cn")
+        self.answer(desktop=None, fallback=["glm-5.3"])
+        ids, meta = P.fetch_remote_product_config("cn")
+        self.assertEqual(ids, ["glm-5.3", "deepseek-v4.1-flash"])
+        self.assertNotIn("cn", P._CATALOG_PENDING_LOSS)
+
+    def test_desktop_gap_requires_the_same_gap_twice(self):
+        self.answer(desktop=["glm-5.3", "deepseek-v4.1-flash"])
+        P.fetch_remote_product_config("cn")
+        self.answer(desktop=["glm-5.3"])
+        self.assertEqual(P.fetch_remote_product_config("cn")[0],
+                         ["glm-5.3", "deepseek-v4.1-flash"])
+        self.assertEqual(P.fetch_remote_product_config("cn")[0], ["glm-5.3"])
+        self.assertNotIn("cn", P._CATALOG_PENDING_LOSS)
+
+    def test_recovered_desktop_list_clears_pending_gap(self):
+        self.answer(desktop=["glm-5.3", "deepseek-v4.1-flash"])
+        P.fetch_remote_product_config("cn")
+        self.answer(desktop=["glm-5.3"])
+        P.fetch_remote_product_config("cn")
+        self.assertIn("cn", P._CATALOG_PENDING_LOSS)
+        self.answer(desktop=["glm-5.3", "deepseek-v4.1-flash"])
+        P.fetch_remote_product_config("cn")
+        self.assertNotIn("cn", P._CATALOG_PENDING_LOSS)
+
+    def test_failed_live_fetch_serves_cached_entries_and_retries_in_60s(self):
+        old = [("old-model", {"credits": "x0.50"})]
+        saved = (dict(P._models_cache), dict(P._catalog_meta),
+                 P.curated_live_sources, P.fetch_endpoint_models)
+        try:
+            P._models_cache["cn"] = {"at": time.time() - 301, "data": old}
+            P._catalog_meta.clear()
+            P.curated_live_sources = lambda realm: ([], False, "remote")
+            P.fetch_endpoint_models = lambda: []
+            result = P.fetch_models("cn")
+            self.assertEqual(result, old)
+            self.assertAlmostEqual(time.time() - P._models_cache["cn"]["at"], 240, delta=3)
+            self.assertNotIn("cn", P._catalog_meta)
+        finally:
+            P._models_cache.clear()
+            P._models_cache.update(saved[0])
+            P._catalog_meta.clear()
+            P._catalog_meta.update(saved[1])
+            P.curated_live_sources, P.fetch_endpoint_models = saved[2:]
+
+    def test_cn_new_generation_models_are_pinned_in_ui_order(self):
+        expected = [model["id"] for model in P.CN_NEW_GEN_MODELS]
+        positions = [P.CN_UI_ORDER.index(model) for model in expected]
+        self.assertEqual(positions, sorted(positions))
+        for model in expected:
+            self.assertIn(model, [item["id"] for item in P.wb_catalog.STATIC_CN_MODELS])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

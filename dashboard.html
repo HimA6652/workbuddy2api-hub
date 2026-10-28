@@ -5527,35 +5527,6 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
               启用更稳的会话键
             </label>
             <button onclick="saveAffinityStableKey(this)">保存</button>
-          </div>
-        </div>
-      </section>
-
-      <section>
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
-          <div>
-            <h2 style="margin:0">上游响应头超时 <em id="setHeaderTimeoutState"></em></h2>
-            <div style="font-size:12px;color:var(--dim);margin-top:4px">
-              单次尝试等上游返回响应头的上限（秒）。拿到响应头之前网关不会向客户端发出任何字节，所以这个值就是客户端要空等的时长：设得比客户端的首字节预算还大时，客户端会先断开（表现为 499 / 首字节迟迟不返回），而网关仍会按这个上限继续换账号重试。默认 120。
-            </div>
-            <div style="font-size:12px;color:var(--warn);margin-top:4px">
-              调小的代价：上游偶尔确实算得慢的正常请求会被提前判失败、换账号重试，多消耗一次额度。建议不高于客户端的首字节预算。
-            </div>
-          </div>
-          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
-            <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
-              <input id="setHeaderTimeout" type="number" min="1" step="1" style="width:90px">
-              秒
-            </label>
-            <button onclick="saveHeaderTimeout(this)">保存</button>
-          </div>
-        </div>
-      </section>
-
-      <section>
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
-          <div>
-            <h2 style="margin:0">日志落库 <em id="setLogDbState"></em></h2>
             <div style="font-size:12px;color:var(--dim);margin-top:4px">
               默认关闭：日志只留在内存（最新 2000 条，重启即失），与上游一致。开启后每条日志追加写入
               <span class="mono">usage/logs.sqlite3</span>，重启、崩溃后仍能回看，方便事后 debug。
@@ -6036,13 +6007,14 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
           <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
             <span style="font-weight:600;font-size:13px;color:var(--fg)">套餐权益包明细</span>
             <span id="cmPkgCountBadge" class="badge mini" style="font-size:11px">共 0 个</span>
+            <span id="cmPkgResultBadge" class="badge mini" style="font-size:11px" aria-live="polite"></span>
           </div>
           <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
             <div class="realm-filter" style="margin:0">
-              <button type="button" data-filter="all" onclick="filterCreditsPackages('all', this)">全部</button>
-              <button type="button" class="active" data-filter="active" onclick="filterCreditsPackages('active', this)">有剩余</button>
-              <button type="button" data-filter="expiring" onclick="filterCreditsPackages('expiring', this)">即将到期</button>
-              <button type="button" data-filter="exhausted" onclick="filterCreditsPackages('exhausted', this)">已用完/过期</button>
+              <button type="button" data-filter="all" aria-pressed="false" onclick="filterCreditsPackages('all', this)">全部</button>
+              <button type="button" class="active" data-filter="active" aria-pressed="true" onclick="filterCreditsPackages('active', this)">有剩余</button>
+              <button type="button" data-filter="expiring" aria-pressed="false" onclick="filterCreditsPackages('expiring', this)">即将到期</button>
+              <button type="button" data-filter="exhausted" aria-pressed="false" onclick="filterCreditsPackages('exhausted', this)">已用完/过期</button>
             </div>
             <input id="cmPkgSearch" type="text" placeholder="搜索包名/代码/来源…" oninput="onCreditsSearchInput(this.value)" style="padding:3px 8px;font-size:11px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);width:140px">
             <select id="cmPkgSort" onchange="onCreditsSortChange(this.value)" style="padding:3px 6px;font-size:11px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)">
@@ -9768,12 +9740,8 @@ async function openCreditsDetail(uid, forceRefresh = false){
   const sortSelect = document.getElementById("cmPkgSort");
   if(sortSelect) sortSelect.value = "expiry_asc";
 
-  // 重置过滤器按钮高亮
-  const filterBtns = document.querySelectorAll(".realm-filter button[data-filter]");
-  filterBtns.forEach(b => {
-    if(b.getAttribute("data-filter") === "all") b.classList.add("active");
-    else b.classList.remove("active");
-  });
+  // 实际筛选与高亮、读屏状态都由同一个状态同步，不再各写一份默认值。
+  syncCreditsPackageFilter();
 
   const acct = (window.ACCOUNTS || []).find(a => a.uid === uid);
   const titleEl = document.getElementById("creditsModalTitle");
@@ -9901,13 +9869,23 @@ async function reloadCreditsDetail(btn){
   }
 }
 
+const CREDITS_PACKAGE_FILTERS = ['all', 'active', 'expiring', 'exhausted'];
+const CREDITS_PACKAGE_FILTER_LABELS = {
+  all: '全部', active: '有剩余', expiring: '即将到期', exhausted: '已用完/过期'
+};
+
+function syncCreditsPackageFilter(){
+  if(!CREDITS_PACKAGE_FILTERS.includes(CURRENT_PKG_FILTER)) CURRENT_PKG_FILTER = 'active';
+  document.querySelectorAll('#creditsDetailModal button[data-filter]').forEach(b => {
+    const selected = b.getAttribute('data-filter') === CURRENT_PKG_FILTER;
+    b.classList.toggle('active', selected);
+    b.setAttribute('aria-pressed', selected ? 'true' : 'false');
+  });
+}
+
 function filterCreditsPackages(filterType, btn){
   CURRENT_PKG_FILTER = filterType;
-  const parent = btn && btn.parentNode;
-  if(parent){
-    parent.querySelectorAll("button").forEach(b => b.classList.remove("active"));
-    btn.classList.add("active");
-  }
+  syncCreditsPackageFilter();
   renderCreditsPackagesTable();
 }
 
@@ -10053,6 +10031,7 @@ function renderCreditsDetail(credits, acct){
 }
 
 function renderCreditsPackagesTable(){
+  syncCreditsPackageFilter();
   const credits = CURRENT_CREDITS_DATA;
   if(!credits) return;
   const tbody = document.getElementById("cmPackagesBody");
@@ -10061,6 +10040,8 @@ function renderCreditsPackagesTable(){
   const rawPkgs = Array.isArray(credits.packages) ? credits.packages : [];
   const countBadge = document.getElementById("cmPkgCountBadge");
   if(countBadge) countBadge.textContent = "共 " + rawPkgs.length + " 个";
+  const resultBadge = document.getElementById("cmPkgResultBadge");
+  if(resultBadge) resultBadge.textContent = "";
 
   // 统一预处理各套餐包的有效期与数值
   const preparedPkgs = rawPkgs.map(p => {
@@ -10131,6 +10112,13 @@ function renderCreditsPackagesTable(){
     }
     return true;
   });
+
+  // 总数保留口径；角标同时给出筛选/搜索后的真实行数。
+  if(resultBadge){
+    const label = CREDITS_PACKAGE_FILTER_LABELS[CURRENT_PKG_FILTER];
+    resultBadge.textContent = label + " " + pkgs.length + " / " + rawPkgs.length + " 个"
+      + (CURRENT_PKG_SEARCH ? " · 含搜索" : "");
+  }
 
   // 排序
   pkgs.sort((a, b) => {

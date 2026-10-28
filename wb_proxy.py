@@ -10942,6 +10942,129 @@ INTL_UI_ORDER = [
     "kimi-k2.6",
     "kimi-k2.8-preview",
 ]
+#: 2026-10 这批新模型不在内置表里，平时只靠上游目录的 extras 分支追加；
+#: 上游偶尔回一份旧代际配置（例如 chat 身份失败后回退 UA 拿到的那份），
+#: 这批模型就整批从 /v1/models 消失，客户端把「目录里没有」直接报成模型
+#: 不存在。把已知的这 5 个钉进内置表并排进 UI 顺序：目录来源怎么抖，
+#: 它们都在（真被上游下架时，请求会 404/4xx，比静默消失好排查得多）。
+CN_NEW_GEN_MODELS = [
+    {'contextWindow': {'defaultLength': 300000, 'supportedLengths': [300000, 600000, 1000000]},
+     'credits': 'x0.97',
+     'descriptionEn': "Kimi's new flagship model. Office work, coding, 3D creation, and "
+                      'long-horizon agent capabilities, all fully upgraded.',
+     'descriptionZh': 'Kimi 全新旗舰模型，3万亿级参数。办公、代码、3D 创作与长程 Agent 能力全面升级。',
+     'id': 'kimi-k3.1-pro',
+     'maxAllowedSize': 1000000,
+     'maxInputTokens': 1000000,
+     'maxOutputTokens': 32000,
+     'name': 'Kimi-K3.1-Pro',
+     'onlyReasoning': True,
+     'reasoning': {'canDisableThinking': False,
+                   'defaultEffort': 'high',
+                   'summary': 'auto',
+                   'supportedEfforts': ['low', 'high', 'max']},
+     'relatedModels': {'builtin-lite': 'wb-lite',
+                       'lite': 'kimi-k3.1-pro',
+                       'reasoning': 'kimi-k3.1-pro'},
+     'supportsImages': True,
+     'supportsReasoning': True,
+     'supportsToolCall': True,
+     'temperature': 1,
+     'vendor': 'f'},
+    {'contextWindow': {'defaultLength': 300000, 'supportedLengths': [300000, 600000, 1000000]},
+     'credits': 'x0.08',
+     'descriptionEn': 'Natively multimodal, strong at Office, agentic, and coding tasks, with '
+                      'excellent inference speed.',
+     'descriptionZh': '原生多模态，擅长office、agentic、编程任务，推理速度优异',
+     'id': 'minimax-m3.1-flash',
+     'maxAllowedSize': 1000000,
+     'maxInputTokens': 1000000,
+     'maxOutputTokens': 128000,
+     'name': 'MiniMax-M3.1-Flash',
+     'onlyReasoning': True,
+     'reasoning': {'canDisableThinking': False,
+                   'defaultEffort': 'max',
+                   'summary': 'auto',
+                   'supportedEfforts': ['low', 'medium', 'high', 'xhigh', 'max']},
+     'relatedModels': {'builtin-lite': 'wb-lite',
+                       'lite': 'minimax-m3.1-flash',
+                       'reasoning': 'minimax-m3.1-flash'},
+     'supportsImages': True,
+     'supportsReasoning': True,
+     'supportsToolCall': True,
+     'temperature': 1,
+     'vendor': 'f'},
+    {'contextWindow': {'defaultLength': 300000, 'supportedLengths': [300000, 1000000]},
+     'credits': 'x0.33',
+     'descriptionEn': "StepFun's flagship model, built for agents that do real work.",
+     'descriptionZh': '阶跃 StepFun 面向真实任务的新一代旗舰基模',
+     'id': 'step-5-preview',
+     'maxAllowedSize': 1000000,
+     'maxInputTokens': 1000000,
+     'maxOutputTokens': 64000,
+     'name': 'Step-5-Preview',
+     'onlyReasoning': True,
+     'reasoning': {'canDisableThinking': False,
+                   'defaultEffort': 'high',
+                   'summary': 'auto',
+                   'supportedEfforts': ['low', 'medium', 'high']},
+     'relatedModels': {'builtin-lite': 'wb-lite',
+                       'lite': 'step-5-preview',
+                       'reasoning': 'step-5-preview'},
+     'supportsImages': True,
+     'supportsReasoning': True,
+     'supportsToolCall': True,
+     'temperature': 1,
+     'vendor': 'f'},
+    {'contextWindow': {'defaultLength': 1000000, 'supportedLengths': [300000, 600000, 1000000]},
+     'credits': 'x0.08',
+     'descriptionEn': 'Blazing-fast, anonymous model with strong coding skills and native '
+                      'multimodal input.',
+     'descriptionZh': '推理速度极快，编码能力强劲，并支持原生多模态输入的匿名大模型',
+     'id': 'space-bunny',
+     'maxAllowedSize': 1000000,
+     'maxInputTokens': 1000000,
+     'maxOutputTokens': 128000,
+     'name': 'Space-Bunny',
+     'onlyReasoning': True,
+     'reasoning': {'canDisableThinking': False,
+                   'defaultEffort': 'max',
+                   'summary': 'auto',
+                   'supportedEfforts': ['low', 'medium', 'high', 'xhigh', 'max']},
+     'relatedModels': {'builtin-lite': 'wb-lite',
+                       'lite': 'space-bunny',
+                       'reasoning': 'space-bunny'},
+     'supportsImages': True,
+     'supportsReasoning': True,
+     'supportsToolCall': True,
+     'temperature': 1,
+     'vendor': 'f'},
+    {'contextWindow': {'defaultLength': 300000, 'supportedLengths': [300000, 600000, 1000000]},
+     'credits': 'x0.13',
+     'descriptionEn': 'Flagship reasoning model for professional, long-horizon, and complex '
+                      'workflows, with advanced research and cybersecurity capabilities.',
+     'descriptionZh': '旗舰推理模型，面向专业、长程、复杂工作流，并兼顾科学研究、网络安全等高阶能力',
+     'id': 'mimo-v2.6-pro',
+     'maxAllowedSize': 1000000,
+     'maxInputTokens': 1000000,
+     'maxOutputTokens': 128000,
+     'name': 'Xiaomi MiMo-V2.6-Pro',
+     'onlyReasoning': True,
+     'reasoning': {'effort': 'high', 'summary': 'auto'},
+     'relatedModels': {'builtin-lite': 'wb-lite',
+                       'lite': 'mimo-v2.6-pro',
+                       'reasoning': 'mimo-v2.6-pro'},
+     'supportsImages': True,
+     'supportsReasoning': True,
+     'supportsToolCall': True,
+     'vendor': 'e'},
+]
+for _model in CN_NEW_GEN_MODELS:
+    if not any(_m.get("id") == _model["id"] for _m in wb_catalog.STATIC_CN_MODELS):
+        wb_catalog.STATIC_CN_MODELS.append(dict(_model))
+    if _model["id"] not in CN_UI_ORDER:
+        CN_UI_ORDER.append(_model["id"])
+
 def merge_reasoning(base, live):
     """Field-level merge of one model's reasoning block.
 
@@ -11106,6 +11229,18 @@ def fetch_models(realm=None):
             extras = False
             if live:
                 source = "endpoint"
+        if not live:
+            # 上游这一轮什么都没拿到（WAF 丢连接、账号全在冷却、网关自己解析失败）。
+            # 内置快照里没有 extras 追加的新模型，退回去等于让 /v1/models 少这批
+            # 模型，客户端会把它们当成「不存在」——只要还留着上一份可用目录就继续
+            # 发它，并把下一次重试提前到 60s 后。
+            stale = (c or {}).get("data")
+            if stale:
+                log("catalog: %s no live source, serving the last good list (%d models)"
+                    % (r, len(stale)), level="WARN")
+                with _lock:
+                    _models_cache[r] = {"at": time.time() - 240.0, "data": stale}
+                return stale
         entries = merge_catalog(live, realm=r, extras=extras)
         note_bundled_reasoning(r, live, entries)
         if not live:
@@ -11457,6 +11592,17 @@ def curate_remote_catalog(realm, ids, meta=None):
     return out
 
 
+#: 上一次成功拿到的目录基线：realm -> (ids, meta, via)。回退 UA 会返回另一份
+#: 配置版本（比桌面身份少十几个新模型、只是多几个老模型），一旦这种「缩水版」
+#: 覆盖了基线，/v1/models 里那批新模型就会整批消失，客户端那边直接表现为
+#: 「模型不存在」。所以只在没有任何模型丢失时才接受回退结果。
+_CATALOG_LAST_GOOD = {}
+
+#: 桌面身份这一轮少给了一批模型、但还只是第一次：realm -> (缺失签名, 时间)。
+#: 同一个缺口连着两轮（缓存一轮 300s）才认账，避免上游抽一下就照抄。
+_CATALOG_PENDING_LOSS = {}
+
+
 def fetch_remote_product_config(realm):
     """(ids, meta) from the realm's own product-config endpoint, or None.
 
@@ -11479,7 +11625,7 @@ def fetch_remote_product_config(realm):
     if cfg.get("billing_ua") and cfg["billing_ua"] != cfg["chat_ua"]:
         uas.append(cfg["billing_ua"])
     last = None
-    for ua in uas:
+    for index, ua in enumerate(uas):
         headers = remote_config_headers(account, realm, ua)
         req = urllib.request.Request(url, headers=headers, method="GET")
         try:
@@ -11490,12 +11636,49 @@ def fetch_remote_product_config(realm):
             continue
         parsed = parse_remote_catalog(payload)
         if parsed:
+            via = "chat" if index == 0 else "fallback"
+            previous = _CATALOG_LAST_GOOD.get(realm)
+            if previous is not None:
+                missing = set(previous[0]) - set(parsed[0])
+                if missing:
+                    signature = ",".join(sorted(missing))
+                    if via == "fallback":
+                        # 回退身份答的本来就是另一代目录（少十几个新模型、多几个
+                        # 老模型），无条件不采信。
+                        log(
+                            "remote catalog: %s fallback UA answered another catalogue "
+                            "(%d models, would drop %d: %s); keeping the last good one"
+                            % (realm, len(parsed[0]), len(missing),
+                               ",".join(sorted(missing)[:6])),
+                            level="WARN",
+                        )
+                        return previous[0], previous[1]
+                    if (_CATALOG_PENDING_LOSS.get(realm) or ("", 0))[0] != signature:
+                        # 桌面身份也少给了模型：可能是上游真下架，也可能是一次抖动。
+                        # 先记一笔、继续发旧目录；同缺口连着出现两轮才采信。
+                        _CATALOG_PENDING_LOSS[realm] = (signature, time.time())
+                        log(
+                            "remote catalog: %s desktop UA answered a catalogue "
+                            "missing %d model(s) (%s); holding the last good one "
+                            "until the same gap repeats"
+                            % (realm, len(missing), ",".join(sorted(missing)[:6])),
+                            level="WARN",
+                        )
+                        return previous[0], previous[1]
+                    log(
+                        "remote catalog: %s desktop UA dropped the same %d model(s) "
+                        "again; accepting the new catalogue"
+                        % (realm, len(missing)),
+                        level="WARN",
+                    )
+            _CATALOG_PENDING_LOSS.pop(realm, None)
             # Keep the PRO-only map from the same payload; it is what the
             # scheduler and /v1/models use to keep free accounts off models
             # the upstream would answer 11158 for.
             wb_tiers.ingest(realm, payload)
             # 成功副本落盘留档（catalog/，纯存档；见 persist_remote_catalog）。
             persist_remote_catalog(realm, payload)
+            _CATALOG_LAST_GOOD[realm] = (list(parsed[0]), parsed[1], via)
             return parsed
         last = "empty catalogue"
     log("remote catalog: %s fetch failed (%s)" % (realm, last))
@@ -11943,7 +12126,6 @@ SANITIZE_DSH_FILEREF_RE = re.compile(
     r"( Relative paths resolve from the workspace root)")
 SANITIZE_DSH_FILEREF_REPLACEMENT = (
     r"\1 Paths resolve relative to the workspace root")
-
 # 品牌词缩减（#574）：`DeepSeek Harness` 单独出现放行，但它和 GUI 描述句
 # （`this page` / `this GUI` / `this app`）连续出现时命中同一套 11-128 校验。
 # 逐段二分实测：只把品牌缩成 `DeepSeek` 就能通过，句子其余部分不用动；
@@ -12005,7 +12187,6 @@ def has_fingerprint(text, identity=True):
     if (SANITIZE_DSH_FILEREF_LOWER in low
             and SANITIZE_DSH_FILEREF_RE.search(text) is not None):
         return True
-
     # 动词短语只是廉价前置筛：真命中与否交给正则判定。这样 "powered by" 出现在
     # 与自我介绍无关的句子（工具/插件的产品描述）时不会走进 sanitize_text 的其余
     # 清洗步骤，也不会白白改写。
@@ -12028,7 +12209,6 @@ def sanitize_text(text, identity=True):
         text = SANITIZE_DSH_GUI_RE.sub(SANITIZE_DSH_GUI_REPLACEMENT, text)
         # @ 路径引用段：只改 B 句开头，A 句原样保留。
         text = SANITIZE_DSH_FILEREF_RE.sub(SANITIZE_DSH_FILEREF_REPLACEMENT, text)
-
         # 品牌词缩减放在最后：GUI 规则还认全名，先让它匹配原文。
         text = SANITIZE_BRAND_RE.sub(SANITIZE_BRAND_REPLACEMENT, text)
     for old, new in SANITIZE_REWRITES:

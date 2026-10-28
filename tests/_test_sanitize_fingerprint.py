@@ -380,6 +380,7 @@ class DshFileReferenceParagraphTests(unittest.TestCase):
         self.assertIn(self.B_REWORDED, system)
         self.assertNotIn(self.B, system)
         self.assertIn(self.A, system)
+
 if __name__ == "__main__":
     unittest.main()
 

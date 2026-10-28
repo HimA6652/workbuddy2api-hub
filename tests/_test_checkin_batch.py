@@ -368,18 +368,30 @@ class TravelVisibilityTests(Base):
     def test_public_exposes_the_checkin_state_machine(self):
         sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         import wb_accounts
+        # 日期一律取「今天」算，别写死：checkinAttempts 是当天累计值，
+        # 硬编码的日期一旦过夜就会被 checkin_attempts_value() 归零（10-27 真栽过）。
+        today = time.strftime("%Y-%m-%d")
         account = wb_accounts.Account({
             "uid": "uid-travel", "realm": "cn", "enabled": True,
-            "lastCheckin": time.strftime("%Y-%m-%d") + " 19:36:23",
+            "lastCheckin": today + " 19:36:23",
             "lastCheckinState": "already",
-            "lastCheckinAt": time.strftime("%Y-%m-%d") + " 20:24:08",
+            "lastCheckinAt": today + " 20:24:08",
             "checkinAttempts": 3,
         })
         row = account.public()
         self.assertEqual(row.get("lastCheckinState"), "already")
-        self.assertEqual(row.get("lastCheckinAt"), time.strftime("%Y-%m-%d") + " 20:24:08")
+        self.assertEqual(row.get("lastCheckinAt"), today + " 20:24:08")
         self.assertEqual(row.get("checkinAttempts"), 3)
-        self.assertEqual(row.get("lastCheckin"), time.strftime("%Y-%m-%d") + " 19:36:23")
+        self.assertEqual(row.get("lastCheckin"), today + " 19:36:23")
+
+        # 跨天归零：昨天的计数不该被当成今天的
+        stale = wb_accounts.Account({
+            "uid": "uid-stale", "realm": "cn", "enabled": True,
+            "lastCheckinState": "already",
+            "lastCheckinAt": "2000-01-01 20:24:08",
+            "checkinAttempts": 3,
+        })
+        self.assertEqual(stale.public().get("checkinAttempts"), 0)
 
 
 if __name__ == "__main__":
