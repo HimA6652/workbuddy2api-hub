@@ -2,6 +2,8 @@
 
 ## v1.10.1
 
+- **Windows 便携运行时依赖按实际文件类型校验**：`select` 在 Windows 由 `DLLs/select.pyd` 提供，并不存在 `Lib/select.py`。此前只检查应用 import 名，没有检查运行时文件是否存在，新增必需项后打包门禁才暴露。必需清单移除虚构的纯 Python 路径、保留实际扩展，并增加本机标准库文件存在性回归；仍用固定 SHA-256 的真实 CPython 运行时构建和启动验证。
+
 - **Windows CI 启动与超时预算加固**：`run_all` 契约夹具把慢 Windows 主机的子进程启动时间与真正挂起的 600 秒探针分开，外层墙钟从 15 秒放宽到 45 秒，仍验证整棵进程树被清理。ETag 网关启动不再因一次连接拒绝就提前判定进程退出，保留真实启动日志；DST 子进程无输出时以 `-X faulthandler -v` 复跑并保留诊断。并发门禁仍执行全部测试，DST 真实断言不跳过。
 
 - **Windows CI 的 DST 回归使用随测试提供的 IANA 数据**：`setup-python` 的 Windows 环境不带系统 IANA 数据库，也未安装可选 `tzdata` 包，导致纽约、柏林和 Lord Howe 三个真实时区探针抛出 `ZoneInfoNotFoundError`。测试现携带三份 public-domain TZif 文件并通过 `PYTHONTZPATH` 加载，继续执行真实日界断言，不增加应用运行依赖、不跳过测试。

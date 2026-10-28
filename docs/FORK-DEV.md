@@ -199,7 +199,7 @@ WB_UPDATE_REPO=someone/workbuddy2api-hub
 
 ### 8.2 Release 历史与发布流程
 
-当前流程：先推 `main` 并确认同一提交的完整测试矩阵通过，再推 `vX.Y.Z` 标签。Release 工作流校验源码与 OpenWrt 版本，构建附件并创建 **Draft Release**；补齐版本说明并发布后，`release-checksums.yml` 会生成 `checksums.txt`。当前已发布 `v1.10.0`，本次发布目标是 `v1.10.1`。
+当前流程：先推 `main` 并确认同一提交的完整测试矩阵通过，再推 `vX.Y.Z` 标签。Release 工作流校验源码与 OpenWrt 版本，构建附件并创建 **Draft Release**；补齐版本说明并发布后，`release-checksums.yml` 会生成 `checksums.txt`。当前已发布 `v1.10.0`，本次发布目标是 `v1.10.1`。若发布打包在标签后才暴露构建输入错误，修复进 main、复跑矩阵，再把同一个尚未发布 Release 的版本标签移到已验收的修复提交；标签本身不等于已发布版本。
 
 以下为 **2026-10-26 首次启用更新检查时**的历史记录（当时还没有任何 Release，现已过时，只用于解释空列表的处理逻辑）：
 

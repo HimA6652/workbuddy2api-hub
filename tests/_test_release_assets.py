@@ -321,6 +321,23 @@ class VisibleLauncherTests(unittest.TestCase):
 class RuntimeTrimTests(unittest.TestCase):
     """The trim rules reproduce the runtime the existing package ships."""
 
+    def test_the_required_stdlib_paths_exist_in_this_distribution(self):
+        """A required Lib path is a file of this platform, not an import name."""
+        import importlib.util
+
+        missing = []
+        for rel in portable_runtime.REQUIRED_FILES:
+            if not rel.startswith("Lib/"):
+                continue
+            name = rel[4:-3].replace("/", ".") if rel.endswith(".py") else None
+            if not name or name.endswith(".__init__"):
+                continue
+            if importlib.util.find_spec(name) is None:
+                missing.append((rel, name))
+        self.assertEqual(missing, [], "运行时需要了本机 Python 根本没有的纯 Python 模块：%s" % missing)
+        self.assertNotIn("Lib/select.py", portable_runtime.REQUIRED_FILES)
+        self.assertIn("DLLs/select.pyd", portable_runtime.REQUIRED_FILES)
+
     def test_the_app_modules_survive_the_trim(self):
         # Every stdlib module the gateway imports has to be in the contract
         # list, or the trim could drop the thing it depends on.
@@ -340,8 +357,9 @@ class RuntimeTrimTests(unittest.TestCase):
                         if m not in local and m not in sys.builtin_module_names)
         self.assertTrue(needed)
         covered = set(portable_runtime.REQUIRED_FILES)
-        missing = [m for m in needed
-                   if ("Lib/%s.py" % m) not in covered and ("Lib/%s/__init__.py" % m) not in covered]
+        # select is a Windows extension (DLLs/select.pyd), not Lib/select.py.
+        missing = [m for m in needed if not any(path in covered for path in (
+            "Lib/%s.py" % m, "Lib/%s/__init__.py" % m, "DLLs/%s.pyd" % m))]
         self.assertEqual(missing, [], "这些导入没有出现在运行时常量表里：%s" % missing)
 
     def test_the_documented_trim_is_exactly_what_goes(self):
