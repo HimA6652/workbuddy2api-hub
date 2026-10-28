@@ -116,7 +116,7 @@ class GateTests(unittest.TestCase):
         proceed, wait, token = self.gate.begin(self.scope)
         self.assertTrue(proceed)
         self.assertNotEqual(token, False)
-        self.assertEqual(self.gate.begin(self.scope)[:2], (False, 180))
+        self.assertEqual(self.gate.begin(self.scope)[:2], (False, 1))
         self.assertEqual(self.gate.begin(self.scope)[2], False)
         self.assertTrue(self.gate.success(self.scope, token))
         proceed, wait, ticket = self.gate.begin(self.scope)
@@ -169,7 +169,7 @@ class GateTests(unittest.TestCase):
         self.clock.now = 3600.0
         proceed, wait, token = self.gate.begin(self.scope)
         self.assertTrue(proceed)
-        self.assertEqual(self.gate.check(self.scope)[:2], (False, 180))
+        self.assertEqual(self.gate.check(self.scope)[:2], (False, 1))
         self.assertEqual(self.gate.snapshot()[0]["phase"], "half_open")
         self.gate.abandon(self.scope, token)
         _, _, token = self.gate.begin(self.scope)
@@ -276,6 +276,31 @@ class GateTests(unittest.TestCase):
             self.assertLessEqual(len(self.gate.states), 2)
         finally:
             Q.MAX_SCOPES = old_max
+
+
+    def test_wait_budget_cancellation_and_clear_wakeup(self):
+        # A closed Gate never sleeps, and a finite Gate never becomes an
+        # infinite retry. These are real wall-clock waits, not mock sleeps.
+        self.assertTrue(self.gate.wait(self.scope, 0.01))
+        self.gate.note(self.scope, 30)
+        started = time.monotonic()
+        self.assertFalse(self.gate.wait(self.scope, 0.03))
+        self.assertLess(time.monotonic() - started, 0.5)
+        with self.assertRaises(Q.QueueWaitCancelled):
+            self.gate.wait(self.scope, 30, cancelled=lambda: True)
+        self.assertEqual(self.gate.waiters, {})
+        result = []
+        waiter = threading.Thread(target=lambda: result.append(
+            self.gate.wait(self.scope, 10)))
+        waiter.start()
+        deadline = time.monotonic() + 2
+        while not self.gate.waiters and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.gate.clear()
+        waiter.join(2)
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual(result, [True])
+        self.assertEqual(self.gate.waiters, {})
 
 
 class RouteTests(unittest.TestCase):
@@ -659,6 +684,185 @@ class RouteTests(unittest.TestCase):
         self.assertFalse(P.MODEL_QUEUE_GATE.check(old_scope)[0])
         self.assertTrue(P.MODEL_QUEUE_GATE.check(Q.queue_scope(a, MODEL))[0])
         self.assertEqual(P.MODEL_QUEUE_GATE.snapshot()[0]["product"], "workbuddy")
+
+    def test_wait_heartbeat_wake_all_and_shared_request_budget(self):
+        gate = P.MODEL_QUEUE_GATE
+        scope = Q.queue_scope(self.accounts[0], MODEL)
+        gate.note(scope, 30)
+        gate.states[scope]["until"] = self.clock.now - 1
+        proceed, _hint, ticket = gate.begin(scope)
+        self.assertTrue(proceed)
+        self.assertTrue(gate.heartbeat(scope, ticket, 300))
+        self.assertEqual(gate.probes[scope]["deadline"], self.clock.now + 300)
+        self.clock.now += 181
+        self.assertEqual(gate.begin(scope)[:2], (False, 1))
+        self.assertFalse(gate.heartbeat(scope, (ticket[0], False), 300))
+        gate.abandon(scope, ticket)
+        self.assertEqual(gate.probes, {})
+
+        gate.note(scope, 30)
+        outcome = []
+        def wait_for_stop():
+            try:
+                outcome.append(gate.wait(scope, 10,
+                                         cancelled=P._client_disconnected))
+            except Q.QueueWaitCancelled:
+                outcome.append("cancelled")
+        waiter = threading.Thread(target=wait_for_stop)
+        with mock.patch.object(P._REQUEST_STOP, "is_set", return_value=True), \
+             mock.patch.object(P, "_client_disconnected", lambda: True):
+            waiter.start()
+            waiter.join(4)
+        self.assertFalse(waiter.is_alive())
+        self.assertEqual(gate.waiters, {})
+        self.assertEqual(outcome, ["cancelled"])
+
+        with mock.patch.object(P.wb_settings, "model_queue_retry", return_value={
+                "model_queue_retry_attempts": 2,
+                "model_queue_wait_budget_seconds": 30}), \
+             mock.patch.object(P.MODEL_QUEUE_GATE, "wait", return_value=False), \
+             mock.patch.object(P, "_pause_request_slots"), \
+             mock.patch.object(P, "_resume_request_slots"):
+            budget = P._new_queue_retry_state()
+            started = time.monotonic()
+            while time.monotonic() - started < 0.015:
+                pass
+            P._REQUEST_CANCEL.queue_retry = budget
+            self.addCleanup(setattr, P._REQUEST_CANCEL, "queue_retry", None)
+            for _realm in ("cn", "intl"):
+                _exc = P.ModelQueueLimited("synthetic busy", scope=scope)
+                with mock.patch.object(P, "_open_upstream_attempts", side_effect=_exc):
+                    with self.assertRaises(P.ModelQueueLimited):
+                        P.open_upstream(self.payload(), target_realm=_realm)
+            self.assertGreater(budget["started"], 0)
+            self.assertEqual(budget["retried"], 0)
+            self.assertEqual(self.calls, [])
+
+    def test_keepalive_requests_own_independent_chat_slots(self):
+        original = P._REQUEST_CANCEL
+        P._REQUEST_CANCEL = threading.local()
+        P._REQUEST_CANCEL.state = [threading.Event(), None, None]
+        P._REQUEST_CANCEL.chat_slot_paused = True
+        self.addCleanup(setattr, P, "_REQUEST_CANCEL", original)
+        slots = threading.BoundedSemaphore(1)
+        with mock.patch.object(P, "_chat_slots", slots):
+            for _ in range(3):
+                P._REQUEST_CANCEL.chat_slot_paused = False
+                self.assertTrue(slots.acquire(blocking=False))
+                P._release_request_chat_slot()
+            self.assertTrue(slots.acquire(blocking=False))
+            slots.release()
+
+    def test_cancellation_after_slot_reacquisition_never_calls_upstream(self):
+        scope = Q.queue_scope(self.accounts[0], MODEL)
+        exc = P.ModelQueueLimited("synthetic busy", scope=scope)
+        P._REQUEST_CANCEL.state = [threading.Event(), None, None]
+        P._REQUEST_CANCEL.chat_slot_paused = False
+        self.addCleanup(setattr, P._REQUEST_CANCEL, "state", None)
+        self.addCleanup(setattr, P._REQUEST_CANCEL, "chat_slot_paused", False)
+        slots = threading.BoundedSemaphore(1)
+        self.assertTrue(slots.acquire(blocking=False))
+        def cancelled():
+            # Exactly the post-resume check, after a real reacquisition.
+            return P._REQUEST_CANCEL.chat_slot_paused is False
+        with mock.patch.object(P.wb_settings, "model_queue_retry", return_value={
+                "model_queue_retry_attempts": 1,
+                "model_queue_wait_budget_seconds": 1}), \
+             mock.patch.object(P.MODEL_QUEUE_GATE, "wait", return_value=True), \
+             mock.patch.object(P, "_client_disconnected", side_effect=cancelled), \
+             mock.patch.object(P, "_chat_slots", slots), \
+             mock.patch.object(P, "_open_upstream_attempts", side_effect=exc):
+            with self.assertRaises(Q.QueueWaitCancelled):
+                self.call()
+            self.assertEqual(self.calls, [])
+            self.assertFalse(P._REQUEST_CANCEL.chat_slot_paused)
+            P._release_request_chat_slot()
+            self.assertTrue(slots.acquire(blocking=False))
+            slots.release()
+
+    def test_slot_restoration_is_bounded_and_does_not_mask_queue_error(self):
+        scope = Q.queue_scope(self.accounts[0], MODEL)
+        exc = P.ModelQueueLimited("synthetic busy", scope=scope)
+        gate_wait = mock.patch.object(P.MODEL_QUEUE_GATE, "wait", return_value=True)
+        # The real global semaphore is occupied by an unrelated model. Queue
+        # waiting must yield this request's slot, not add another 30s wait or
+        # turn a real upstream 429 into QueueWaitCancelled / a silent close.
+        P._chat_slots.acquire()
+        self.addCleanup(P._chat_slots.release)
+        settings = mock.patch.object(P.wb_settings, "model_queue_retry", return_value={
+            "model_queue_retry_attempts": 1,
+            "model_queue_wait_budget_seconds": 1})
+        P._REQUEST_CANCEL.state = [threading.Event(), None, None]
+        self.addCleanup(setattr, P._REQUEST_CANCEL, "state", None)
+        self.addCleanup(setattr, P._REQUEST_CANCEL, "chat_slot_paused", False)
+        with gate_wait, settings, mock.patch.object(P, "CHAT_SLOT_WAIT_SECONDS", 30), \
+             mock.patch.object(P, "_client_disconnected", return_value=False), \
+             mock.patch.object(P, "_open_upstream_attempts", side_effect=exc):
+            started = time.monotonic()
+            with self.assertRaises(P.ModelQueueLimited) as raised:
+                P.open_upstream(self.payload(), target_realm="cn")
+            self.assertIs(raised.exception, exc)
+            self.assertLess(time.monotonic() - started, 5)
+            if P._REQUEST_CANCEL.chat_slot_paused:
+                P._release_request_chat_slot()
+                self.assertFalse(P._REQUEST_CANCEL.chat_slot_paused)
+        self.assertEqual(self.calls, [])
+
+    def test_settings_validate_merge_and_survive_save(self):
+        defaults = wb_settings.model_queue_retry(self.tmp.name)
+        self.assertEqual(defaults, {
+            "model_queue_retry_attempts": 0,
+            "model_queue_wait_budget_seconds": 30})
+        # A syntactically valid but huge stored integer must fail closed to
+        # defaults, not turn a real queue response into a local OverflowError.
+        wb_settings.save(self.tmp.name, {
+            "model_queue_retry_attempts": 10 ** 400,
+            "model_queue_wait_budget_seconds": 10 ** 400})
+        self.assertEqual(wb_settings.model_queue_retry(self.tmp.name), defaults)
+        stored = wb_settings.set_model_queue_retry(self.tmp.name, {
+            "model_queue_retry_attempts": 2})
+        self.assertEqual(stored, {
+            "model_queue_retry_attempts": 2,
+            "model_queue_wait_budget_seconds": 30})
+        self.assertEqual(wb_settings.model_queue_retry(self.tmp.name), stored)
+        for invalid in (None, [], {"model_queue_retry_attempts": True},
+                        {"model_queue_retry_attempts": 9},
+                        {"model_queue_wait_budget_seconds": 121},
+                        {"model_queue_wait_budget_seconds": "30.5"}):
+            with self.assertRaises(ValueError):
+                wb_settings.validate_model_queue_retry_patch(invalid)
+        self.assertEqual(wb_settings.validate_model_queue_retry_patch({
+            "model_queue_retry_attempts": "2",
+            "model_queue_wait_budget_seconds": 30.0}), {
+                "model_queue_retry_attempts": 2,
+                "model_queue_wait_budget_seconds": 30})
+        class SaveRequest:
+            _handle_settings_save = P.Handler._handle_settings_save
+            def __init__(self, payload): self.payload, self.answer = payload, []
+            def _payload_or_error(self, allow_list=False): return self.payload
+            def _json(self, code, body): self.answer.append((code, body))
+            def _error(self, code, message, kind):
+                self.answer.append((code, {"error": message}))
+        with mock.patch.object(P, "ACCOUNTS_DIR", self.tmp.name), \
+             mock.patch.object(P, "apply_log_db_settings", lambda: None):
+            request = SaveRequest({})
+            request._handle_settings_save()
+            self.assertEqual(request.answer[0][0], 200)
+            self.assertEqual(wb_settings.model_queue_retry(self.tmp.name), stored)
+            request = SaveRequest({"model_queue_retry": {
+                "model_queue_retry_attempts": 9}})
+            request._handle_settings_save()
+            self.assertEqual(request.answer[0][0], 400)
+            self.assertEqual(wb_settings.model_queue_retry(self.tmp.name), stored)
+            request = SaveRequest({"model_queue_retry": {
+                "model_queue_wait_budget_seconds": 30}})
+            request._handle_settings_save()
+            self.assertEqual(request.answer[0][0], 200)
+            self.assertEqual(wb_settings.model_queue_retry(self.tmp.name), {
+                "model_queue_retry_attempts": 2,
+                "model_queue_wait_budget_seconds": 30})
+        with mock.patch.object(P, "ACCOUNTS_DIR", self.tmp.name):
+            self.assertEqual(P.runtime_settings_view()["model_queue_retry"], stored)
 
     def test_probe_large_queue_json_keeps_shared_scope(self):
         a = self.accounts[0]

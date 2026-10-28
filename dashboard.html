@@ -5495,6 +5495,33 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       <section>
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
           <div>
+            <h2 style="margin:0">公共模型队列有界重试 <em id="setModelQueueRetryState"></em></h2>
+            <div style="font-size:12px;color:var(--dim);margin-top:4px">
+              仅处理 6020 / 6021 公共入口排队，不增加账号选择并发，也不改正常轮询。重试次数指初次之后，等待预算是同一客户端请求的总上限；0 次或 0 秒都保持立即返回 429。保存后立即生效。
+            </div>
+            <div style="font-size:12px;color:var(--dim);margin-top:4px">
+              6020 的 retry_after 按秒等待，6021 有界退避；持续繁忙最终保留原始上游错误。客户端重试仍独立计数，持续高并发不能靠无限等待掩盖上游容量。
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+            <label for="setModelQueueRetryAttempts" style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
+              重试
+              <input id="setModelQueueRetryAttempts" type="number" min="0" max="8" step="1" style="width:70px">
+              次
+            </label>
+            <label for="setModelQueueRetryBudget" style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
+              预算
+              <input id="setModelQueueRetryBudget" type="number" min="0" max="120" step="1" style="width:80px">
+              秒
+            </label>
+            <button onclick="saveModelQueueRetry(this)">保存</button>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+          <div>
             <h2 style="margin:0">账号级并发上限 <em id="setAccountConcurrentState"></em></h2>
             <div style="font-size:12px;color:var(--dim);margin-top:4px">
               一个上游账号同时最多接几个请求。0 = 不限（默认，跟没这个功能一样）；1 = 一个账号同时只接一个；N = 一个账号最多同时接 N 个。
@@ -11941,6 +11968,19 @@ async function loadSettings(showToast){
         headerTimeoutState.textContent = headerTimeoutDefault ? '(默认 120 秒)' : '(' + headerTimeout + ' 秒)';
         headerTimeoutState.style.color = headerTimeoutDefault ? 'var(--dim)' : 'var(--accent2)';
       }
+      const modelQueueRetry = data.model_queue_retry || {};
+      const retryAttempts = modelQueueRetry.model_queue_retry_attempts === undefined ? 0 : modelQueueRetry.model_queue_retry_attempts;
+      const retryBudget = modelQueueRetry.model_queue_wait_budget_seconds === undefined ? 30 : modelQueueRetry.model_queue_wait_budget_seconds;
+      const retryAttemptsInput = document.getElementById("setModelQueueRetryAttempts");
+      const retryBudgetInput = document.getElementById("setModelQueueRetryBudget");
+      if(retryAttemptsInput) retryAttemptsInput.value = retryAttempts;
+      if(retryBudgetInput) retryBudgetInput.value = retryBudget;
+      const retryState = document.getElementById("setModelQueueRetryState");
+      if(retryState){
+        const retryEnabled = retryAttempts > 0 && retryBudget > 0;
+        retryState.textContent = retryEnabled ? "(已启用)" : "(未启用)";
+        retryState.style.color = retryEnabled ? "var(--accent2)" : "var(--dim)";
+      }
       const logDbEnabled = data.log_db_enabled === true;
       const logDbEnabledInput = document.getElementById('setLogDbEnabled');
       if(logDbEnabledInput) logDbEnabledInput.checked = logDbEnabled;
@@ -13164,6 +13204,28 @@ async function saveHeaderTimeout(btn){
     loadSettings();
   } catch(e) {
     toast('保存失败: ' + e.message, 'bad');
+  } finally {
+    if(btn) btn.disabled = false;
+  }
+}
+
+async function saveModelQueueRetry(btn){
+  const attemptsEl = document.getElementById("setModelQueueRetryAttempts");
+  const budgetEl = document.getElementById("setModelQueueRetryBudget");
+  const attempts = Number(attemptsEl && attemptsEl.value);
+  const waitBudget = Number(budgetEl && budgetEl.value);
+  if(!Number.isInteger(attempts) || attempts < 0 || attempts > 8 ||
+     !Number.isInteger(waitBudget) || waitBudget < 0 || waitBudget > 120){
+    toast("重试次数请输入 0–8 的整数，等待预算请输入 0–120 的整数秒", "bad");
+    return;
+  }
+  if(btn) btn.disabled = true;
+  try {
+    await postJSON("/settings/save", {model_queue_retry: {model_queue_retry_attempts: attempts, model_queue_wait_budget_seconds: waitBudget}});
+    toast("已保存：公共队列重试 " + attempts + " 次 / 总等待 " + waitBudget + " 秒", "ok");
+    loadSettings();
+  } catch(e) {
+    toast("保存失败: " + e.message, "bad");
   } finally {
     if(btn) btn.disabled = false;
   }

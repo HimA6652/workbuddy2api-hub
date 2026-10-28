@@ -18,6 +18,7 @@ class IdCollector(HTMLParser):
         HTMLParser.__init__(self)
         self.ids = []
         self.header_inputs = []
+        self.retry_inputs = {}
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
@@ -26,6 +27,8 @@ class IdCollector(HTMLParser):
             self.ids.append(element_id)
         if element_id == "setHeaderTimeout":
             self.header_inputs.append((tag, attrs))
+        if element_id in ("setModelQueueRetryAttempts", "setModelQueueRetryBudget"):
+            self.retry_inputs[element_id] = (tag, attrs)
 
 
 class DashboardSettingsMarkupTests(unittest.TestCase):
@@ -56,6 +59,25 @@ class DashboardSettingsMarkupTests(unittest.TestCase):
         # 删掉的是整组卡片，而不是把第二组的 save 按钮/输入框遗留下来。
         self.assertNotIn("调整上游读取响应头（首字节）的超时时间。\n", self.source)
         self.assertEqual(self.parser.ids.count("setHeaderTimeout"), 1)
+
+    def test_model_queue_retry_controls_have_bounded_inputs_and_real_save(self):
+        self.assertEqual(len(self.parser.retry_inputs), 2)
+        for name, upper in (("setModelQueueRetryAttempts", "8"),
+                            ("setModelQueueRetryBudget", "120")):
+            tag, attrs = self.parser.retry_inputs[name]
+            self.assertEqual(tag, "input")
+            self.assertEqual(attrs.get("type"), "number")
+            self.assertEqual(attrs.get("min"), "0")
+            self.assertEqual(attrs.get("max"), upper)
+            self.assertEqual(self.parser.ids.count(name), 1)
+        self.assertEqual(self.source.count("saveModelQueueRetry(this)"), 1)
+        self.assertIn("data.model_queue_retry || {}", self.source)
+        self.assertIn("Number.isInteger(attempts)", self.source)
+        self.assertIn("Number.isInteger(waitBudget)", self.source)
+        self.assertIn('postJSON("/settings/save", {model_queue_retry: '
+                      '{model_queue_retry_attempts: attempts, '
+                      'model_queue_wait_budget_seconds: waitBudget}})',
+                      self.source)
 
 
 if __name__ == "__main__":

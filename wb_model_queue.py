@@ -19,6 +19,9 @@ MAX_BACKOFF_STREAK = 5
 PROBE_LEASE_SECONDS = 180.0
 MAX_WAIT_HINT_SECONDS = 3600.0
 MAX_SCOPES = 256
+# Wake sleepers promptly on state changes, while retaining a bounded poll for
+# client-disconnect callbacks and a crash/expiry backstop.
+WAIT_POLL_SECONDS = 0.2
 # Only JSON error bodies are decoded. This is larger than observed queue envelopes
 # (including padded fixtures) while retaining a finite per-error memory bound.
 QUEUE_ERROR_BODY_LIMIT = 8 * 1024 * 1024
@@ -95,6 +98,10 @@ def scope_key(scope):
     return tuple(scope)
 
 
+class QueueWaitCancelled(Exception):
+    """The client went away while the gateway waited for a shared queue."""
+
+
 class ModelQueueGate(object):
     """Lock-protected Gate with generation-checked real-request admissions.
 
@@ -106,8 +113,10 @@ class ModelQueueGate(object):
     def __init__(self, clock=None):
         self.clock = clock or time.monotonic
         self.lock = threading.Lock()
+        self._changed = threading.Condition(self.lock)
         self.states = {}
         self.probes = {}
+        self.waiters = {}
 
     @staticmethod
     def _delay(streak, retry_after=None):
@@ -163,6 +172,7 @@ class ModelQueueGate(object):
         # The next begin() will issue exactly one new lease after the new delay.
         self.probes.pop(key, None)
         self._retain(protected=key)
+        self._changed.notify_all()
         return max(1, int(round(until - now)))
 
     def note(self, scope, retry_after=None):
@@ -184,12 +194,57 @@ class ModelQueueGate(object):
             probe = self.probes.get(key)
             if probe is not None:
                 if now < probe["deadline"]:
-                    return False, max(1, int(round(probe["deadline"] - now))), False
+                    # The probe is in flight, not a claim that congestion lasts
+                    # until its crash lease expires. Clients get a short hint;
+                    # configured local waiters are woken by its actual result.
+                    return False, 1, False
                 del self.probes[key]
             token = object()
             self.probes[key] = {"token": token, "generation": generation,
                                 "deadline": now + PROBE_LEASE_SECONDS}
             return True, 0, (generation, token)
+
+    def wait(self, scope, timeout, cancelled=None):
+        """Wait for admission without creating a probe or polling upstream.
+
+        The budget uses the real monotonic clock even when tests give the Gate
+        a synthetic state clock. Condition wakeups follow every generation
+        change, successful recovery and abandoned probe. The caller retries
+        begin() after True; False means its finite request budget expired.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        key = scope_key(scope)
+        with self._changed:
+            self.waiters[key] = self.waiters.get(key, 0) + 1
+            try:
+                while True:
+                    if cancelled is not None and cancelled():
+                        raise QueueWaitCancelled()
+                    now = self.clock()
+                    row = self.states.get(key)
+                    probe = self.probes.get(key)
+                    half_open = bool(probe and now < probe["deadline"])
+                    if not self._fresh(row, now) and not half_open:
+                        return True
+                    wake_at = max(now, row["until"] if row else now)
+                    if half_open:
+                        wake_at = max(wake_at, probe["deadline"])
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    # Re-evaluate fresh 6020/6021 evidence immediately instead
+                    # of sleeping through an extended upstream retry_after.
+                    # An active probe has no short ETA: wait for its result,
+                    # not for the full 180-second crash lease.
+                    delay = (WAIT_POLL_SECONDS if half_open
+                             else max(0.01, wake_at - now))
+                    self._changed.wait(min(WAIT_POLL_SECONDS, delay, remaining))
+            finally:
+                count = self.waiters.get(key, 1) - 1
+                if count > 0:
+                    self.waiters[key] = count
+                else:
+                    self.waiters.pop(key, None)
 
     def _owns(self, key, ticket):
         probe_token = self._probe_token(ticket)
@@ -230,6 +285,7 @@ class ModelQueueGate(object):
             self.states[key] = {"until": 0.0, "streak": 0,
                                 "generation": self._generation(row) + 1}
             self.probes.pop(key, None)
+            self._changed.notify_all()
             return True
 
     def fail(self, scope, ticket=False, retry_after=None):
@@ -249,6 +305,21 @@ class ModelQueueGate(object):
                 return self._stale_wait(row, retry_after)
             return self._note_locked(key, retry_after)
 
+    def heartbeat(self, scope, ticket, lease_seconds=None):
+        """Extend the existing real request, never create a second probe.
+
+        An upstream response-header timeout may exceed the crash lease. The
+        thread blocked in urlopen is still the sole probe; refreshing its
+        lease keeps recovery single-flight for the whole actual network wait.
+        """
+        seconds = max(1.0, float(lease_seconds or PROBE_LEASE_SECONDS))
+        with self.lock:
+            key = scope_key(scope)
+            if not self._owns(key, ticket):
+                return False
+            self.probes[key]["deadline"] = self.clock() + seconds
+            return True
+
     def abandon(self, scope, ticket):
         """Release only this probe; do not invent recovery or extra delay."""
         if self._probe_token(ticket) is False:
@@ -257,6 +328,16 @@ class ModelQueueGate(object):
             key = scope_key(scope)
             if self._owns(key, ticket):
                 self.probes.pop(key, None)
+                self._changed.notify_all()
+
+    def wake_all(self):
+        """Unblock sleepers during draining; a finite retry must still finish.
+
+        This is deliberately not clear(): closing the shared Gate on hotswap
+        would falsify congestion evidence and could duplicate upstream work.
+        """
+        with self.lock:
+            self._changed.notify_all()
 
     def check(self, scope):
         """Read-only fallback check, including an active half-open lease."""
@@ -268,7 +349,7 @@ class ModelQueueGate(object):
                 return False, max(1, int(round(row["until"] - now)))
             probe = self.probes.get(key)
             if probe and now < probe["deadline"]:
-                return False, max(1, int(round(probe["deadline"] - now)))
+                return False, 1
             return True, 0
 
     def snapshot(self):
@@ -280,8 +361,9 @@ class ModelQueueGate(object):
                 half_open = bool(probe and now < probe["deadline"])
                 if not self._fresh(row, now) and not half_open:
                     continue
-                wait = max(row["until"] - now,
-                           probe["deadline"] - now if half_open else 0.0)
+                # Public Retry-After is the queue delay, never the unrelated
+                # 180-second crash backstop for an in-flight real request.
+                wait = row["until"] - now
                 out.append({"realm": scope[0], "model": scope[1],
                             "product": scope[2], "endpoint": scope[3],
                             "phase": "half_open" if half_open else "open",
@@ -295,3 +377,6 @@ class ModelQueueGate(object):
         with self.lock:
             self.states.clear()
             self.probes.clear()
+            # Administrative clearing must release existing waiters too, not
+            # leave them asleep until their original retry_after expires.
+            self._changed.notify_all()

@@ -60,7 +60,9 @@ try:
 except ValueError:
     MAX_CONCURRENT_CHAT = CHAT_SLOTS_FLOOR
 CHAT_SLOT_WAIT_SECONDS = float(os.environ.get("WB_CHAT_SLOT_WAIT", 30))
+import select
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -5922,6 +5924,66 @@ POOL = None
 # time, so resetting at the start of every request is enough to keep a
 # keep-alive connection from leaking the previous request's pin.
 _PINNED = threading.local()
+# Per-connection cancellation state. A keep-alive thread handles one request
+# at a time, so a new event at dispatch cannot cancel the preceding request.
+_REQUEST_CANCEL = threading.local()
+# Process-local stop signal: draining wakes pre-upstream queue waiters without
+# cancelling requests that are already receiving a model response.
+_REQUEST_STOP = threading.Event()
+
+
+def _new_queue_retry_state():
+    """One finite queue budget for every retry within one client request."""
+    return {"started": time.monotonic(), "retried": 0}
+
+
+def _queue_retry_state():
+    state = getattr(_REQUEST_CANCEL, "queue_retry", None)
+    if state is None:
+        state = _new_queue_retry_state()
+        _REQUEST_CANCEL.queue_retry = state
+    return state
+
+
+def _pause_request_slots():
+    """Yield only the global chat slot while this request waits on a queue.
+
+    The per-key slot stays owned until the normal dispatch finally runs. This
+    preserves its exact acquire/release pairing even if the client disconnects.
+    """
+    state = getattr(_REQUEST_CANCEL, "state", None)
+    if not (isinstance(state, list) and len(state) == 3):
+        return
+    _chat_slots.release()
+    _REQUEST_CANCEL.chat_slot_paused = True
+
+
+def _release_request_chat_slot():
+    """Pair the dispatch finally with the slot this request actually owns.
+
+    A queue waiter may have yielded its slot and exhausted its budget before
+    reacquiring it. In that case releasing a semaphore now owned by another
+    request would corrupt accounting; an unconditional compensating acquire
+    would instead hang beyond the budget. The request-local flag avoids both.
+    """
+    if getattr(_REQUEST_CANCEL, "chat_slot_paused", False):
+        _REQUEST_CANCEL.chat_slot_paused = False
+        return
+    _chat_slots.release()
+
+
+def _resume_request_slots(timeout=None):
+    """Rejoin normal chat accounting within a finite, caller-supplied budget.
+
+    False is not a client disconnect. The caller must preserve the observed
+    upstream 429 instead of silently closing the connection. The dispatch
+    finally still releases exactly one slot whether or not reacquisition wins.
+    """
+    seconds = CHAT_SLOT_WAIT_SECONDS if timeout is None else max(0.0, float(timeout))
+    acquired = _chat_slots.acquire(timeout=seconds)
+    if acquired:
+        _REQUEST_CANCEL.chat_slot_paused = False
+    return acquired
 
 
 def pinned_ref():
@@ -10265,6 +10327,7 @@ def runtime_settings_view():
         "api_keys": keys,
         "deleted_api_keys": deleted_keys,
         "limits": wb_settings.limits_snapshot(ACCOUNTS_DIR),
+        "model_queue_retry": wb_settings.model_queue_retry(ACCOUNTS_DIR),
         "reserve_credits": wb_settings.reserve_credits(ACCOUNTS_DIR),
         "daily_token_limit": wb_settings.daily_token_limit(ACCOUNTS_DIR),
         "daily_credit_limit": wb_settings.daily_credit_limit(ACCOUNTS_DIR),
@@ -14854,18 +14917,63 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
         callback = lifecycle.get("cleanup")
         if callback is not None:
             callback()
-    try:
-        return _open_upstream_attempts(payload, session_key=session_key,
-            target_realm=target_realm, prebuilt_body=prebuilt_body,
-            allow_credit_fallback=allow_credit_fallback,
-            allow_product_switch=allow_product_switch, pin_account=pin_account,
-            defer_egress_success=defer_egress_success,
-            allowed_accounts=allowed_accounts, register_cleanup=register_cleanup)
-    finally:
-        # Success already cleared queue_pending and transferred slot_held to
-        # the response. Any other exit is still cleaned here, including errors
-        # before the transport try and immediate ModelQueueLimited exits.
-        run_cleanup()
+    queue_retry = _queue_retry_state()
+    while True:
+        try:
+            return _open_upstream_attempts(payload, session_key=session_key,
+                target_realm=target_realm, prebuilt_body=prebuilt_body,
+                allow_credit_fallback=allow_credit_fallback,
+                allow_product_switch=allow_product_switch, pin_account=pin_account,
+                defer_egress_success=defer_egress_success,
+                allowed_accounts=allowed_accounts, register_cleanup=register_cleanup)
+        except ModelQueueLimited as exc:
+            cfg = wb_settings.model_queue_retry(ACCOUNTS_DIR)
+            retries = cfg[wb_settings.MODEL_QUEUE_RETRY_ATTEMPTS_KEY]
+            budget = cfg[wb_settings.MODEL_QUEUE_WAIT_BUDGET_KEY]
+            if (queue_retry["retried"] >= retries or budget <= 0
+                    or getattr(exc, "queue_scope", None) is None):
+                raise
+            # No upstream response bytes have been exposed yet, so a bounded
+            # retry cannot duplicate model output. The Gate retains the only
+            # real recovery probe; waiters never poll accounts on their own.
+            remaining = float(budget) - (time.monotonic() - queue_retry["started"])
+            if remaining <= 0:
+                raise
+            log("model queue: %s busy, bounded wait %d/%d, retry_after=%ds, budget=%.1fs"
+                % (payload.get("model") or "-", queue_retry["retried"] + 1, retries,
+                   exc.wait, remaining))
+            _pause_request_slots()
+            resumed = False
+            admitted = MODEL_QUEUE_GATE.wait(exc.queue_scope, remaining,
+                                              cancelled=_client_disconnected)
+            # Gate admission and semaphore reacquisition share the original
+            # request budget. Neither becomes a new unbounded wait.
+            remaining = float(budget) - (time.monotonic() - queue_retry["started"])
+            if _REQUEST_STOP.is_set() or _client_disconnected():
+                raise wb_model_queue.QueueWaitCancelled()
+            resumed = remaining > 0 and _resume_request_slots(remaining)
+            if _REQUEST_STOP.is_set() or _client_disconnected():
+                # Cancellation can race the bounded slot reacquisition. Check
+                # again after it returns: a reacquired slot is returned by the
+                # normal dispatch finally, but no new upstream call may start.
+                raise wb_model_queue.QueueWaitCancelled()
+            if not admitted or not resumed:
+                # Preserve the observed 6020/6021 and its exact final hint.
+                # The next exception would be local Gate state, which cannot
+                # truthfully claim another upstream response was received.
+                log("model queue: %s wait/slot budget exhausted; returning upstream 429"
+                    % (payload.get("model") or "-"))
+                raise exc
+            queue_retry["retried"] += 1
+            # Fresh evidence may have lengthened retry_after during the wait;
+            # begin() revalidates it before any actual upstream call.
+            continue
+        finally:
+            # Success already cleared queue_pending and transferred slot_held to
+            # the response. Any other exit is still cleaned here, including errors
+            # before the transport try and immediate ModelQueueLimited exits.
+            run_cleanup()
+
 
 
 def _open_upstream_attempts(payload, session_key=None, target_realm=None, prebuilt_body=None,
@@ -15284,8 +15392,31 @@ def _open_upstream_attempts(payload, session_key=None, target_realm=None, prebui
             queue_retarget(account, chat_url, attempt_product)
             queue_admit()
         try:
-            resp = wb_accounts.urlopen(req, timeout=header_timeout,
-                                       proxy=account.proxy)
+            # One transport call can exceed the original crash lease. Renew only
+            # this exact real probe while waiting for headers; never start a
+            # background probe or open a second recovery request.
+            resp = None
+            transport_error = None
+            transport_done = threading.Event()
+
+            def await_headers():
+                nonlocal resp, transport_error
+                try:
+                    resp = wb_accounts.urlopen(req, timeout=header_timeout,
+                                               proxy=account.proxy)
+                except BaseException as exc:
+                    transport_error = exc
+                finally:
+                    transport_done.set()
+
+            transport = threading.Thread(target=await_headers, daemon=True)
+            transport.start()
+            while not transport_done.wait(min(30.0, float(header_timeout) / 2)):
+                MODEL_QUEUE_GATE.heartbeat(queue_scope, queue_token,
+                                           max(180.0, float(header_timeout) + 30.0))
+            transport.join()
+            if transport_error is not None:
+                raise transport_error
             MODEL_QUEUE_GATE.success(queue_scope, queue_token)
             queue_pending = False
             _apply_stream_idle_timeout(resp, idle_timeout)
@@ -15729,6 +15860,32 @@ def realm_fallback_target(realm, model):
     except Exception:
         return ""
     return "cn"
+
+
+def _client_disconnected():
+    """Best-effort cancellation during a pre-upstream queue wait only.
+
+    The request body has already been consumed. MSG_PEEK observes the client
+    socket without consuming a pipelined request or calling a blocking read.
+    Upstream socket reads keep their established header/idle timeout behavior.
+    """
+    state = getattr(_REQUEST_CANCEL, "state", None)
+    if not state:
+        return False
+    event, sock = state[:2]
+    if event.is_set() or _REQUEST_STOP.is_set():
+        return True
+    try:
+        readable, _, _ = select.select([sock], [], [], 0)
+        if readable and not sock.recv(1, socket.MSG_PEEK):
+            event.set()
+            return True
+    except (BlockingIOError, ssl.SSLWantReadError):
+        return False
+    except (OSError, ValueError):
+        event.set()
+        return True
+    return False
 
 
 def open_upstream_with_fallback(payload, session_key=None, target_realm=None,
@@ -18848,7 +19005,25 @@ class Handler(BaseHTTPRequestHandler):
         if not hasattr(self, mname):
             self.send_error(501, "Unsupported method (%r)" % self.command)
             return
-        getattr(self, mname)()
+        cancel_event = threading.Event()
+        _REQUEST_CANCEL.state = [cancel_event, self.connection, self.key_entry]
+        _REQUEST_CANCEL.queue_retry = _new_queue_retry_state()
+        # This handler thread serves every request on one keep-alive connection.
+        # Slot ownership is per request, not per connection: a previous waiter
+        # that failed to reacquire must not make this request skip its release.
+        _REQUEST_CANCEL.chat_slot_paused = False
+        try:
+            getattr(self, mname)()
+        except wb_model_queue.QueueWaitCancelled:
+            # The caller has gone away: there is no socket left for an error
+            # response. Do not turn cancellation into another upstream retry.
+            self.close_connection = True
+            return
+        finally:
+            cancel_event.set()
+            _REQUEST_CANCEL.state = None
+            _REQUEST_CANCEL.queue_retry = None
+            _REQUEST_CANCEL.chat_slot_paused = False
         self.wfile.flush()
     def handle_one_request(self):
         # 热切换的排空依据：进入一条请求 +1，处理完 -1。旧进程一旦进入 draining，
@@ -19625,6 +19800,8 @@ class Handler(BaseHTTPRequestHandler):
         # 回响应、延迟退出：0.4s 让 _json 的 body 先 flush 到 socket；端口
         # 随进程释放，下次启动走原来的启动脚本。
         def _bye():
+            _REQUEST_STOP.set()
+            MODEL_QUEUE_GATE.wake_all()
             time.sleep(0.4)
             try:
                 sys.stdout.flush()
@@ -21006,6 +21183,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, str(exc), "invalid_request_error")
             wb_settings.set_upstream_config(ACCOUNTS_DIR, patch)
             reply["upstream"] = wb_settings.upstream_config(ACCOUNTS_DIR)
+        if "model_queue_retry" in payload:
+            try:
+                patch = wb_settings.validate_model_queue_retry_patch(
+                    payload.get("model_queue_retry"))
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            reply["model_queue_retry"] = wb_settings.set_model_queue_retry(
+                ACCOUNTS_DIR, patch)
         if "usage" in payload:
             raw = payload.get("usage")
             if not isinstance(raw, dict):
@@ -22586,6 +22771,8 @@ class Handler(BaseHTTPRequestHandler):
                          account=getattr(exc, "account_uid", None),
                          key=self._key_id())
             return self._error(exc.code, f"upstream {exc.code}: {detail}")
+        except wb_model_queue.QueueWaitCancelled:
+            raise
         except Exception as exc:
             message = str(exc)
             record_error(model, 502, message,
@@ -22825,6 +23012,8 @@ class Handler(BaseHTTPRequestHandler):
                 upstream, account, _ = follow_up_with_tool_results(
                     calls, holder, model, session_key, t_start, drop_tools=give_up,
                     **key_open_kwargs(getattr(self, "key_entry", None)))
+            except wb_model_queue.QueueWaitCancelled:
+                raise
             except Exception as exc:
                 record_error(model, 502, "web tool follow-up failed: %s" % exc,
                              elapsed_ms=int((time.time() - t_start) * 1000),
@@ -22938,6 +23127,8 @@ class Handler(BaseHTTPRequestHandler):
                          key=self._key_id())
             return self._anthropic_error(exc.code,
                                          "upstream %s: %s" % (exc.code, detail))
+        except wb_model_queue.QueueWaitCancelled:
+            raise
         except Exception as exc:
             message = str(exc)
             low = message.lower()
@@ -23202,6 +23393,9 @@ class Handler(BaseHTTPRequestHandler):
         _apply_background_model_alias(payload)
         # Check per-key concurrency limit (#359)
         key_ok, cur_key_conc, max_key_conc = _acquire_key_slot(self.key_entry)
+        state = getattr(_REQUEST_CANCEL, "state", None)
+        if isinstance(state, list) and len(state) == 3:
+            state[2] = self.key_entry
         if not key_ok:
             key_name = (self.key_entry or {}).get("name") or self._key_id() or "当前 Key"
             message = ("Rate limit reached: API key '%s' reached its concurrency limit (%d in flight); retry shortly"
@@ -23225,7 +23419,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     return self._handle_messages(payload)
                 finally:
-                    _chat_slots.release()
+                    _release_request_chat_slot()
             # Both OpenAI-shaped routes below can hold a thread for up to 600s.
             # Take a slot for the duration; release it in finally so every early
             # return (including client disconnects) gives the slot back.
@@ -23235,7 +23429,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 return self._dispatch_chat_post(path, payload)
             finally:
-                _chat_slots.release()
+                _release_request_chat_slot()
         finally:
             _release_key_slot(self.key_entry)
 
@@ -23331,6 +23525,8 @@ class Handler(BaseHTTPRequestHandler):
                          account=getattr(exc, "account_uid", None),
                          key=self._key_id())
             return self._error(exc.code, f"upstream {exc.code}: {detail}")
+        except wb_model_queue.QueueWaitCancelled:
+            raise
         except Exception as exc:
             message = str(exc)
             record_error(model, 502, message, elapsed_ms=int((time.time() - t_start) * 1000),
@@ -24164,6 +24360,12 @@ def _hotswap_worker(server, child, ready_path):
         except Exception:
             pass
         server.shutdown()
+        # Do not let a queued-but-not-yet-upstream request hold the old
+        # process until its retry_after expires. Existing upstream streams
+        # still drain normally; queue waiters wake and close their connection
+        # so clients can reconnect to the new listener.
+        _REQUEST_STOP.set()
+        MODEL_QUEUE_GATE.wake_all()
         try:
             server.server_close()
         except Exception:

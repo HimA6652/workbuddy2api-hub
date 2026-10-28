@@ -19,6 +19,16 @@ import threading
 import time
 
 DEFAULT_PANEL_PASSWORD = "admin"
+
+# Optional, bounded local waiting for upstream model queue 6020/6021.
+# Disabled by default: upgrading an existing deployment never silently holds
+# its clients open. The production LAN gateway opts in explicitly after tests.
+MODEL_QUEUE_RETRY_ATTEMPTS_KEY = "model_queue_retry_attempts"
+MODEL_QUEUE_WAIT_BUDGET_KEY = "model_queue_wait_budget_seconds"
+MODEL_QUEUE_RETRY_ATTEMPTS_DEFAULT = 0
+MODEL_QUEUE_RETRY_ATTEMPTS_MAX = 8
+MODEL_QUEUE_WAIT_BUDGET_DEFAULT = 30
+MODEL_QUEUE_WAIT_BUDGET_MAX = 120
 PBKDF2_ROUNDS = 120_000
 SESSION_TTL = 7 * 24 * 3600
 # How often the gateway pulls fresh prices, in minutes; keep in step with
@@ -1545,6 +1555,71 @@ def validate_upstream_patch(raw):
         else:
             raise ValueError("unknown upstream setting %r" % key)
     return out
+
+
+def _bounded_integer(value, default, maximum):
+    if isinstance(value, bool):
+        return default
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if number < 0 or number > maximum:
+        return default
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if numeric != number:
+        return default
+    return number
+
+
+def model_queue_retry(accounts_dir):
+    stored = load(accounts_dir)
+    return {
+        MODEL_QUEUE_RETRY_ATTEMPTS_KEY: _bounded_integer(
+            stored.get(MODEL_QUEUE_RETRY_ATTEMPTS_KEY),
+            MODEL_QUEUE_RETRY_ATTEMPTS_DEFAULT, MODEL_QUEUE_RETRY_ATTEMPTS_MAX),
+        MODEL_QUEUE_WAIT_BUDGET_KEY: _bounded_integer(
+            stored.get(MODEL_QUEUE_WAIT_BUDGET_KEY),
+            MODEL_QUEUE_WAIT_BUDGET_DEFAULT, MODEL_QUEUE_WAIT_BUDGET_MAX),
+    }
+
+
+def validate_model_queue_retry_patch(raw):
+    if not isinstance(raw, dict):
+        raise ValueError("model_queue_retry must be an object")
+    out = {}
+    limits = {
+        MODEL_QUEUE_RETRY_ATTEMPTS_KEY: MODEL_QUEUE_RETRY_ATTEMPTS_MAX,
+        MODEL_QUEUE_WAIT_BUDGET_KEY: MODEL_QUEUE_WAIT_BUDGET_MAX,
+    }
+    for key, value in raw.items():
+        if key not in limits:
+            raise ValueError("unknown model queue retry setting %r" % key)
+        if isinstance(value, bool) or value is None:
+            raise ValueError("%s must be a whole number" % key)
+        try:
+            number = int(value)
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("%s must be a whole number" % key)
+        if numeric != number:
+            raise ValueError("%s must be a whole number" % key)
+        if number < 0 or number > limits[key]:
+            raise ValueError("%s must be between 0 and %d" % (key, limits[key]))
+        out[key] = number
+    return out
+
+
+def set_model_queue_retry(accounts_dir, patch):
+    clean = validate_model_queue_retry_patch(patch)
+    with _lock:
+        data = load(accounts_dir)
+        data.update(clean)
+        save(accounts_dir, data)
+    return model_queue_retry(accounts_dir)
 
 
 def upstream_config(accounts_dir):
