@@ -96,5 +96,71 @@ class NoteSuccessTests(unittest.TestCase):
         self.assertTrue(account.public()["tokenExpired"])
 
 
+class AuthChallengeTests(unittest.TestCase):
+    """A gateway that names the credential as bad is evidence, HTML body or not.
+
+    APISIX (copilot.tencent.com) answers a dead token with an HTML 401 page and
+    puts the reason in `WWW-Authenticate: Bearer ..., error="invalid_token"`.
+    Reading only the body made that look exactly like the proxy page of #435, so
+    the panel test showed an opaque HTML error and the account stayed in the
+    pool while every dispatch bounced.
+    """
+
+    @staticmethod
+    def error(code=401, challenge=None, url="https://copilot.tencent.com/v2/chat/completions"):
+        import email.message
+        import urllib.error
+        headers = email.message.Message()
+        if challenge:
+            headers["WWW-Authenticate"] = challenge
+        return urllib.error.HTTPError(url, code, "Unauthorized", headers, None)
+
+    def test_invalid_token_outranks_the_html_bail_out(self):
+        message = wb_accounts.http_error_message(
+            self.error(challenge='Bearer realm="copilot", error="invalid_token", '
+                                'error_description="invalid token"'),
+            "<html><title>401 Authorization Required</title></html>")
+        self.assertTrue(wb_accounts._auth_failure_text(message))
+
+    def test_proxy_page_without_a_challenge_stays_exempt(self):
+        message = wb_accounts.http_error_message(
+            self.error(), "<html><title>401 Authorization Required</title></html>")
+        self.assertEqual(
+            message, "HTTP 401: <html><title>401 Authorization Required</title></html>")
+        self.assertFalse(wb_accounts._auth_failure_text(message))
+
+        basic = wb_accounts.http_error_message(
+            self.error(challenge='Basic realm="staging"'),
+            "<html><title>401 Authorization Required</title></html>")
+        self.assertFalse(wb_accounts._auth_failure_text(basic))
+
+    def test_challenge_is_bounded_and_whitespace_collapsed(self):
+        import email.message
+        headers = email.message.Message()
+        headers["WWW-Authenticate"] = 'Bearer\n  realm="copilot",\t error="invalid_token"'
+        self.assertEqual(wb_accounts.auth_challenge(headers),
+                         'Bearer realm="copilot", error="invalid_token"')
+        self.assertEqual(wb_accounts.auth_challenge(email.message.Message()), "")
+        self.assertEqual(wb_accounts.auth_challenge(None), "")
+
+    def test_truncation_cannot_cut_the_challenge_off(self):
+        # Callers cut the label to 80/150 chars before it reaches the panel,
+        # so the header has to sit in front of the body.
+        message = wb_accounts.http_error_message(
+            self.error(challenge='Bearer realm="copilot", error="invalid_token"'),
+            "<html>" + "x" * 400, 80)
+        self.assertIn("invalid_token", message)
+        self.assertLess(len(message), 260)
+
+    def test_panel_probe_message_parks_the_account(self):
+        account = make_account()
+        account.note_error(wb_accounts.http_error_message(
+            self.error(challenge='Bearer realm="copilot", error="invalid_token"'),
+            "<html><title>401 Authorization Required</title></html>"), 80)
+        self.assertTrue(account.token_expired)
+        self.assertFalse(account.ready())
+        self.assertIn("invalid_token", account.last_error)
+
+
 if __name__ == "__main__":
     unittest.main()

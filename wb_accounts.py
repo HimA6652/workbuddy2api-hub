@@ -3900,6 +3900,41 @@ def _human_delta(seconds):
     return "%d min" % int(seconds / 60)
 
 
+AUTH_CHALLENGE_MARK = "www-authenticate: "
+
+
+def auth_challenge(headers):
+    """The `WWW-Authenticate` value of a 401, whitespace-collapsed and bounded.
+
+    Gateways such as APISIX answer a dead token with an HTML page whose reason
+    lives only in this header (`Bearer realm="copilot", error="invalid_token"`).
+    Reading it is what separates "the credential is bad" from "a proxy page
+    answered", which the body alone cannot tell apart.
+    """
+    try:
+        value = headers.get("www-authenticate") if headers else ""
+    except Exception:
+        return ""
+    return " ".join(str(value or "").split())[:160]
+
+
+def http_error_message(exc, detail, limit=None):
+    """Diagnosis string for an HTTPError: `HTTP <code>: <body>`, plus the challenge.
+
+    The challenge goes *before* the body on purpose. Callers truncate the label
+    (80/150 chars) and `note_error` keeps only 200, so a header appended at the
+    end would be the first thing cut - exactly the evidence that matters.
+    """
+    body = str(detail or "")
+    if limit:
+        body = body[:limit]
+    code = getattr(exc, "code", "")
+    challenge = auth_challenge(getattr(exc, "headers", None))
+    if not challenge:
+        return "HTTP %s: %s" % (code, body)
+    return "HTTP %s (%s%s): %s" % (code, AUTH_CHALLENGE_MARK, challenge, body)
+
+
 def _auth_failure_text(text):
     """True for a credential-shaped 401, not an intermediate proxy page.
 
@@ -3907,12 +3942,20 @@ def _auth_failure_text(text):
     that the token is dead: parking the account on it would take a healthy
     credential out of rotation until a manual re-login (#435). Only mark the
     account when the failure itself names authorization.
+
+    RFC 6750 `error="invalid_token"` is such a naming, and it outranks the HTML
+    bail-out: APISIX (copilot.tencent.com) rejects a dead token with an HTML
+    page and puts the reason in `WWW-Authenticate`, so the body alone looks
+    exactly like a proxy page while the header says the credential is bad.
+    `http_error_message()` keeps that header in the diagnosis string.
     """
     lower = str(text or "").lower()
+    if "invalid_token" in lower or "invalid-token" in lower:
+        return True
     if "<html" in lower:
         return False
     return ("401" in lower or "unauthorized" in lower or "authorization" in lower
-            or "token expired" in lower or "invalid_token" in lower)
+            or "token expired" in lower)
 
 
 def _human_left(seconds):
