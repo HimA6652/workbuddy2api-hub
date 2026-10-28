@@ -141,6 +141,9 @@ class Scheduler:
         self._catchup_pending = True
         self.all_hours = sorted(list(set(self.checkin_hours + self.travel_hours + self.keepalive_hours + self.cat_hours)))
         self.enabled = True
+        self._startup_cycle_lock = threading.Lock()
+        # 暂停 / 热切换期间跳过的启动补跑，在恢复后仍要执行一次。
+        self._startup_cycle_pending = True
         self._stop_event = threading.Event()
         self._thread = None
         self._probe_thread = None
@@ -223,7 +226,13 @@ class Scheduler:
         # 启动后先休眠 10 秒等待主服务就绪，然后执行初次检查
         time.sleep(10)
         try:
-            self._execute_cycle("启动初次初始化巡检", catchup_tasks=True)
+            # 热切换接管者已 enabled=False，但启动巡检原先绕过这个开关；
+            # 等旧进程退出后的普通循环仍会补跑，不能在交接期间重复签到。
+            if self.enabled:
+                self._execute_cycle("启动初次初始化巡检", catchup_tasks=True)
+                self._startup_cycle_pending = False
+            else:
+                self.log("跳过启动初次初始化巡检：调度器暂停或热切换等待旧进程排空")
         except Exception as exc:
             self.log(f"初次巡检异常: {exc}")
         # 进程停过一段时间的话，重置时刻可能已经过去：启动就补一次窗口探针，
@@ -237,6 +246,13 @@ class Scheduler:
             now = time.localtime()
             cur_hour = now.tm_hour
             cur_min = now.tm_min
+            if self.enabled and self._startup_cycle_pending:
+                self.log("调度器恢复：补跑启动初次初始化巡检")
+                try:
+                    self._execute_cycle("启动初次初始化巡检", catchup_tasks=True)
+                    self._startup_cycle_pending = False
+                except Exception as exc:
+                    self.log(f"初次巡检异常: {exc}")
             if self.enabled:
                 # 网页活跃的独立时段是分钟级：先于整点检查，避免整点那次
                 # sleep(65) 把同一分钟的时段跨过去。

@@ -195,7 +195,14 @@ try:
         sys.exit(1)
 
     print("[1] 未切换时：/hotswap/status 是 idle（active 只含这条查询本身）")
-    state = status_json()
+    # /health 返回时上一条连接的 finally 可能还没减 active；那不是另一条
+    # 仍在处理的业务请求。等这一短暂收尾结束，再断言「只有这次查询自己」。
+    state = {}
+    for _ in range(100):
+        state = status_json()
+        if state.get("active") == 1:
+            break
+        time.sleep(0.05)
     check("phase=idle", state.get("phase") == "idle", state)
     check("child_pid 为空", state.get("child_pid") in (None, 0), state)
     check("active=1（自己）", state.get("active") == 1, state)
@@ -266,9 +273,31 @@ try:
     print("[5] 接管期间两个进程并存：新进程的调度器先按住，别和旧进程同时签到")
     TOKEN = login()
     check("新进程可以用同一口令登录", bool(TOKEN))
-    sched = as_json(request("GET", "/scheduler", timeout=15)[2])
+    # 登录的响应先回，并不保证旧进程已经执行到 shutdown()。交接窗口内
+    # 新 token 的下一请求仍可能由旧进程 accept，返回 401。仅对这种明确
+    # 的认证窗口重新登录；不读取旧进程的 health.pid，也不掩盖其他状态。
+    sched = {}
+    for _ in range(100):
+        TOKEN = login()
+        _status, _headers, sched_body = request("GET", "/scheduler", timeout=15)
+        candidate = as_json(sched_body)
+        # 登录也来自新进程，故同一新 token 的 200 已证明调度器响应归属。
+        # 不另发独立 health：共享 listen socket 可让两条连接由不同进程 accept。
+        if _status != 200:
+            time.sleep(0.05)
+            continue
+        # 初始化中的 /scheduler 也可能返回 enabled=False；必须拿到完整快照，
+        # 并且 enabled=True 是业务失败而不是继续等待的过渡状态。
+        if candidate.get("enabled") is True:
+            sched = candidate
+            break
+        if candidate.get("enabled") is False and all(
+                key in candidate for key in ("last_run_time", "next_run_time", "logs", "mode")):
+            sched = candidate
+            break
+        time.sleep(0.05)
     check("新进程调度器处于暂停（等旧进程退出）",
-          sched.get("enabled") is False, sched.get("enabled"))
+          sched.get("enabled") is False, sched)
 
     print("[6] 切换之后才把 body 发完：那条请求仍由旧进程答完")
     time.sleep(0.3)

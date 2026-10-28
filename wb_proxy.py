@@ -24053,6 +24053,10 @@ def _bootstrap_runtime(args):
     global SCHEDULER
     from wb_scheduler import Scheduler
     SCHEDULER = Scheduler(POOL)
+    # 热切换先暂停，再启动线程：bootstrap 超过 10 秒也不能让新进程
+    # 在旧进程仍服务时执行初次巡检 / 定时签到。
+    if getattr(args, "inherit_socket", None) is not None:
+        SCHEDULER.enabled = False
     SCHEDULER.start()
     # 目录兜底：每天至少从上游 API 取一次（活跃使用的部署里 300s 缓存早就
     # 刷得更新，这个线程只兜长时间没人访问 / 一直吃缓存文件或内置快照）。
