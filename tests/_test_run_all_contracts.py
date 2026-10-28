@@ -57,7 +57,10 @@ HANG_BUDGET = 60
 #: The bound the harness itself puts on a sandbox runner, far below
 #: HANG_SECONDS on purpose: the harness must never wait for a runner that has
 #: stopped honouring its own wall clock.
-SANDBOX_BUDGET = 15
+# On a busy Windows CI host a child Python may take longer than the old 15s
+# budget just to start. Keep the broken-runner wall clock far below the
+# probe's 600s sleep, but do not kill it before it can register its pid.
+SANDBOX_BUDGET = 45
 
 #: The grandchild outlives the check but not the test session, so a host that
 #: refuses the tree kill cannot leave a ten-minute orphan behind.
@@ -278,8 +281,8 @@ def wait_gone(pid, seconds=10.0):
     return not alive(pid)
 
 
-def read_pids(path, seconds=15.0):
-    """Read a probe's registered pids, waiting for the file to appear."""
+def read_pids(path, seconds=45.0):
+    """Wait for a real child to start, without weakening tree-cleanup checks."""
     deadline = time.time() + seconds
     while time.time() < deadline:
         try:

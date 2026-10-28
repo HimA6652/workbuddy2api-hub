@@ -99,10 +99,12 @@ now = time.time()
 write_rows([row(now - 600 - 30 * i, total_tokens=100 + i, account="a%d" % (i % 2 + 1))
             for i in range(12)])
 
+server_log_path = os.path.join(work, "gateway.log")
+server_log = open(server_log_path, "w+b")
 proc = life.spawn_managed(
     [PY, os.path.join(ROOT, "wb_proxy.py"), "--port", str(port), "--host", "127.0.0.1",
      "--accounts-dir", store],
-    cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
+    cwd=ROOT, stdout=server_log, stderr=subprocess.STDOUT,
     env=dict(os.environ, WB_PROXY_USAGE_DIR=usage_dir, WB_STATS_TTL=str(TTL)))
 
 TOKEN = None
@@ -135,16 +137,28 @@ def poll(path, extra=None, conn=None):
 
 
 def wait_ready():
-    for _ in range(40):
-        time.sleep(0.5)
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        # Always sample the listener after a failed connection: a refused
+        # connection while the child is still starting is not proof it died.
+        if proc.poll() is not None:
+            return False
         try:
             status, _, _ = get("/health")
             if status == 200:
                 return True
         except Exception:
-            if proc.poll() is not None:
-                return False
+            pass
+        time.sleep(0.5)
     return False
+
+
+def server_diagnostics():
+    server_log.flush()
+    with open(server_log_path, "rb") as fh:
+        text = fh.read().decode("utf-8", "replace")[-8000:]
+    return "pid=%s returncode=%r port=%s\n%s" % (
+        proc.pid, proc.poll(), port, text)
 
 
 def login():
@@ -195,7 +209,7 @@ def synced_tag(path, extra=None):
 
 try:
     if not wait_ready():
-        print("  [FAIL] server did not start")
+        print("  [FAIL] server did not start\n" + server_diagnostics())
         sys.exit(1)
     TOKEN = login()
     if not TOKEN:
@@ -378,6 +392,7 @@ try:
 
 finally:
     life.stop_managed(proc)
+    server_log.close()
     shutil.rmtree(work, ignore_errors=True)
 
 print()

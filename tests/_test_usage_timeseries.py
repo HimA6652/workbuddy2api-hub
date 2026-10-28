@@ -136,8 +136,22 @@ class TimeseriesTests(unittest.TestCase):
                     [sys.executable, os.path.join(root, "tests",
                                                  "_usage_calendar_days_probe.py"), zone],
                     cwd=root, env=env, capture_output=True, text=True, timeout=30)
-                self.assertEqual(result.returncode, 0,
-                                 result.stdout + "\n" + result.stderr)
+                if result.returncode or not result.stdout.strip():
+                    diagnostic = subprocess.run(
+                        [sys.executable, "-X", "faulthandler", "-v",
+                         os.path.join(root, "tests",
+                                      "_usage_calendar_days_probe.py"), zone],
+                        cwd=root, env=env, capture_output=True, text=True,
+                        timeout=30)
+                    detail = (
+                        "silent child: exe=%r cwd=%r TZ=%s PYTHONTZPATH=%r\n"
+                        "first: rc=%s stdout=%r stderr=%r\n"
+                        "diagnostic: rc=%s stdout=%r stderr=%r"
+                        % (sys.executable, root, zone, zones,
+                           result.returncode, result.stdout, result.stderr,
+                           diagnostic.returncode, diagnostic.stdout,
+                           diagnostic.stderr))
+                    self.fail(detail)
                 self.assertIn("calendar-day buckets OK", result.stdout)
 
     def test_custom_window_hour_and_minute_buckets_align_to_wall_clock(self):

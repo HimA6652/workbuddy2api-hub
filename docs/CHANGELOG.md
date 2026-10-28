@@ -2,6 +2,8 @@
 
 ## v1.10.1
 
+- **Windows CI 启动与超时预算加固**：`run_all` 契约夹具把慢 Windows 主机的子进程启动时间与真正挂起的 600 秒探针分开，外层墙钟从 15 秒放宽到 45 秒，仍验证整棵进程树被清理。ETag 网关启动不再因一次连接拒绝就提前判定进程退出，保留真实启动日志；DST 子进程无输出时以 `-X faulthandler -v` 复跑并保留诊断。并发门禁仍执行全部测试，DST 真实断言不跳过。
+
 - **Windows CI 的 DST 回归使用随测试提供的 IANA 数据**：`setup-python` 的 Windows 环境不带系统 IANA 数据库，也未安装可选 `tzdata` 包，导致纽约、柏林和 Lord Howe 三个真实时区探针抛出 `ZoneInfoNotFoundError`。测试现携带三份 public-domain TZif 文件并通过 `PYTHONTZPATH` 加载，继续执行真实日界断言，不增加应用运行依赖、不跳过测试。
 
 - **K3.1 等公共模型队列支持有界、可取消的本地重试**：6020 / 6021 原先只使用共享 Gate 与单飞半开恢复，没有真正等待上游 `retry_after`；本次补的是等待语义，不改变账号轮询或增加账号选择并发。设置项 `model_queue_retry_attempts`（默认 0，最多 8，指初次之后的重试次数）和 `model_queue_wait_budget_seconds`（默认 30，最大 120，0 表示不作排队等待）同时启用后，同一客户端请求最多等待该预算并按提示重试。6020 的 `retry_after=8` 按 8 秒使用，6021 保留有界退避；上游持续繁忙、预算耗尽或名额恢复失败都明确返回原始 429 / `upstream_code` / `Retry-After`，不会无限重试或掩盖上游。等待由 Condition 唤醒，恢复仍只有一条真实请求；慢响应头超时可续租同一探针。跨 realm / 产品切换共用请求预算，真实断开和进程停止会取消等待；等待者暂让全局 chat slot，另一模型可继续服务。未部署的环境变量 / `settings.json` 未写新键时仍快速失败；启用需显式保存 `model_queue_retry` 配置并热切换。预算与提示同为 8 秒时，到点已获 Gate admission 的请求立即非阻塞恢复 chat slot 再重试，不再因为浮点边界少一次重试或额外等待 30 秒。真实 HTTP 夹具在客户端结束后增加服务端 slot cleanup 屏障，避免读完整响应就替换全局 Semaphore 所造成的假 over-release。活跃半开探针对外返回 1 秒等待提示，不把 180 秒崩溃兜底租约当作 Retry-After。慢响应头的恢复租约最长续到 `max(60, 3 × header_timeout)` 秒，超时放弃旧代次但仍等待原 socket，迟到成功不能清除新限流证据；恢复全局 chat slot 时以最多 0.2 秒的分片等待检查客户端断开和进程停止，避免信号量占满时多等一整个超时。
