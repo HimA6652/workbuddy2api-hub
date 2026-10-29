@@ -4016,10 +4016,13 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
            onkeydown="if(event.key==='Enter') submitPanelLogin()"
            style="width:100%;background:var(--panel2);border:1px solid var(--line);
                   border-radius:8px;padding:9px 12px;color:var(--fg);font:inherit">
-    <div id="panelLoginMsg" style="font-size:12px;color:var(--bad);min-height:17px;margin:8px 0 12px"></div>
+    <div id="panelLoginMsg" style="font-size:12px;color:var(--bad);min-height:17px;margin:8px 0 12px;word-break:break-word;line-height:1.4"></div>
     <button onclick="submitPanelLogin()" style="width:100%;padding:9px 12px;font-size:13px">进入面板</button>
     <div id="panelDefaultHint" style="display:none;font-size:11px;color:var(--warn);margin-top:12px">
       当前仍在使用默认密码 <b>admin</b>，登录后请在「设置」中修改。
+    </div>
+    <div id="panelCryptoWarning" style="display:none;font-size:11px;color:var(--bad);margin-top:12px;line-height:1.4;word-break:break-word">
+      警告：当前 Python 解释器缺少 <code>hashlib.pbkdf2_hmac</code> 支持。若使用 Windows 便携版 Python，可能因系统安全策略（如 Smart App Control）拦截了 <code>DLLs/_hashlib.pyd</code>。自定义密码将无法登录，请更换为完整 Python 或放行该 DLL。
     </div>
   </div>
 </div>
@@ -10899,6 +10902,8 @@ async function bootPanel(){
   } catch(e) { PANEL_STATUS = {}; }
   const hint = document.getElementById('panelDefaultHint');
   if(hint && PANEL_STATUS.panel_password_is_default) hint.style.display = 'block';
+  const cryptoWarn = document.getElementById('panelCryptoWarning');
+  if(cryptoWarn && PANEL_STATUS.crypto_ok === false) cryptoWarn.style.display = 'block';
   if(PANEL_STATUS.authenticated){
     panelHideGate();
     await startDashboard();

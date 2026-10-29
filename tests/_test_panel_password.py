@@ -12,6 +12,8 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
+import hashlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -55,6 +57,35 @@ class PanelPasswordTests(unittest.TestCase):
         wb_settings.set_panel_password(self.directory, "admin")
         self.assertTrue(wb_settings.verify_panel_password(self.directory, "admin"))
         self.assertTrue(wb_settings.panel_password_is_default(self.directory))
+        self.assertFalse(wb_settings.verify_panel_password(self.directory, "secret123"))
+
+    def test_check_pbkdf2_available_normal(self):
+        ok, reason = wb_settings.check_pbkdf2_available()
+        self.assertTrue(ok)
+        self.assertEqual("", reason)
+
+    def test_verify_raises_explicit_crypto_error_when_pbkdf2_missing(self):
+        wb_settings.set_panel_password(self.directory, "secret123")
+        with mock.patch.object(hashlib, "pbkdf2_hmac", side_effect=AttributeError("no attribute 'pbkdf2_hmac'")):
+            with self.assertRaises(wb_settings.PanelPasswordCryptoError) as ctx:
+                wb_settings.verify_panel_password(self.directory, "secret123")
+            self.assertIn("hashlib.pbkdf2_hmac", str(ctx.exception))
+
+    def test_default_password_still_opens_even_if_pbkdf2_missing(self):
+        with mock.patch.object(hashlib, "pbkdf2_hmac", side_effect=AttributeError("no attribute 'pbkdf2_hmac'")):
+            self.assertTrue(wb_settings.verify_panel_password(self.directory, "admin"))
+
+    def test_set_password_raises_explicit_crypto_error_when_pbkdf2_missing(self):
+        with mock.patch.object(hashlib, "pbkdf2_hmac", side_effect=AttributeError("no attribute 'pbkdf2_hmac'")):
+            with self.assertRaises(wb_settings.PanelPasswordCryptoError) as ctx:
+                wb_settings.set_panel_password(self.directory, "newsecret")
+            self.assertIn("hashlib.pbkdf2_hmac", str(ctx.exception))
+
+    def test_corrupt_salt_hex_returns_false_safely(self):
+        wb_settings.set_panel_password(self.directory, "secret123")
+        data = wb_settings.load(self.directory)
+        data["panel_password_salt"] = "not_a_valid_hex_string"
+        wb_settings.save(self.directory, data)
         self.assertFalse(wb_settings.verify_panel_password(self.directory, "secret123"))
 
 
