@@ -55,7 +55,10 @@ const api = new Function('state', 'document', '$', 'Date', 'api', 'getJSON', 'PO
   state,
   {getElementById:element, querySelector:selector => selector === '#creditHistoryTable tbody' ? element('creditBody') : null},
   element,
-  class extends Date { static now(){return nowMs;} },
+  class extends Date {
+    constructor(...args) { super(...(args.length ? args : [nowMs])); }
+    static now() { return nowMs; }
+  },
   async url => {
     requests.push(url);
     if (pending) return pending;
