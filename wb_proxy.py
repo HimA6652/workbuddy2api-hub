@@ -15590,6 +15590,10 @@ def _open_upstream_attempts(payload, session_key=None, target_realm=None, prebui
                 cap_at = time.time() if is_cap else 0.0
                 if is_cap:
                     account.model_cap_marks[model] = cap_at
+                else:
+                    # A plain 429 starts a new window; the previous 6004 mark
+                    # must not make the panel call it quota exhaustion.
+                    account.model_cap_marks.pop(model, None)
                 schedule_window_probe(account, model, reset_at, cap=is_cap,
                                       cap_at=cap_at)
                 if reset_at:

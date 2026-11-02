@@ -97,6 +97,31 @@ class CapMarkTests(unittest.TestCase):
         self.assertIsNotNone(entry)
         self.assertNotIn("cappedAt", entry)
 
+    def test_an_old_cap_mark_does_not_label_a_newer_plain_window(self):
+        """上一窗口的 6004 撞线时刻不能贴到后来的普通 429 窗口上。"""
+        account = self._account()
+        now = time.time()
+        account.model_cooldowns[MODEL] = now + 600
+        account.model_cooldowns_at[MODEL] = now - 60
+        account.model_cap_marks[MODEL] = now - 3600
+
+        entry = self._cooldown_entry(account)
+        self.assertIsNotNone(entry, "窗口没有挂上模型冷却")
+        self.assertNotIn("cappedAt", entry,
+                         "旧窗口的撞线时刻被贴到了新窗口上")
+
+    def test_a_current_cap_mark_still_labels_its_window(self):
+        """同一窗口内的撞线时刻仍然要显示，不能把修复做成全丢。"""
+        account = self._account()
+        now = time.time()
+        account.model_cooldowns[MODEL] = now + 600
+        account.model_cooldowns_at[MODEL] = now - 60
+        account.model_cap_marks[MODEL] = now - 30
+
+        entry = self._cooldown_entry(account)
+        self.assertIsNotNone(entry)
+        self.assertEqual(int(now - 30), entry.get("cappedAt"))
+
     def test_the_credential_file_stays_out_of_the_paid_model(self):
         """限额联动的范围不变：收费模型仍不写 modelCaps。"""
         account = self._account()

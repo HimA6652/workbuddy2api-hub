@@ -1260,10 +1260,19 @@ class Account(object):
             if self.cap_until(model, now) > 0:
                 capped_at = int(self.model_caps[model]["at"])
             else:
+                # Only a mark belonging to this active window may label it:
+                # a later plain 429 starts a new window and must not inherit
+                # the previous window’s 6004 timestamp (issue #668 follow-up).
                 try:
-                    capped_at = int(self.model_cap_marks.get(model) or 0)
+                    mark = int(self.model_cap_marks.get(model) or 0)
                 except (TypeError, ValueError):
-                    capped_at = 0
+                    mark = 0
+                try:
+                    window_started = int(started or 0)
+                except (TypeError, ValueError):
+                    window_started = 0
+                if mark and (not window_started or mark >= window_started):
+                    capped_at = mark
             if capped_at:
                 entry["cappedAt"] = capped_at
             models.append(entry)
