@@ -162,6 +162,49 @@ class NoRefreshTests(unittest.TestCase):
         self.assertEqual(1, pool.count_ready(refresh=False))
         self.assertEqual([], calls)
 
+    def test_expired_token_is_not_ready_without_refresh(self):
+        # A credential whose expiry is already past must not be counted as
+        # ready by the read-only health probe: public()["tokenExpired"] and
+        # unavailable_reason() already say 凭证已过期.  The flag is not set here
+        # because it is only written after a failed refresh.  With refresh the
+        # account is available again as soon as refresh() succeeds.
+        acc = account()
+        acc.expires_at = time.time() - 1
+        calls = []
+        acc.refresh = lambda: calls.append(1) or True
+        self.assertFalse(acc.ready(refresh=False))
+        self.assertEqual([], calls)
+        self.assertTrue(acc.ready())
+        self.assertEqual([1], calls)
+
+    def test_count_ready_skips_expired_accounts_without_refresh(self):
+        pool = A.AccountPool(os.environ["ACCOUNTS_DIR"])
+        acc = account()
+        acc.expires_at = time.time() - 1
+        calls = []
+        acc.refresh = lambda: calls.append(1) or True
+        pool.accounts = [acc]
+        self.assertEqual(0, pool.count_ready(refresh=False))
+        self.assertEqual([], calls)
+
+    def test_pool_readiness_refreshes_only_the_whole_pool(self):
+        # /health used to refresh once per realm plus once for the current
+        # realm; with several expiring accounts that multiplied the upstream
+        # identity calls behind one probe.  Only the whole-pool total keeps
+        # refresh=True now; every per-realm count is read-only.
+        pool = A.AccountPool(os.environ["ACCOUNTS_DIR"])
+        pool.accounts = [account(realm="cn")]
+        calls = []
+        def spy(**kwargs):
+            calls.append(kwargs)
+            return 0
+        pool.count_ready = spy
+        P.pool_readiness(pool)
+        self.assertEqual({}, calls[0])
+        self.assertTrue(calls[1:])
+        for kwargs in calls[1:]:
+            self.assertIs(False, kwargs.get("refresh"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

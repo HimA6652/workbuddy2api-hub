@@ -1921,7 +1921,11 @@ class Account(object):
                 return True
             return self.refresh()
         if not refresh:
-            return True
+            # 已经过了有效期：只读口径不能刷新，就不能把这个号算成可用。
+            # 早先这里返回 True，/health 的按模型统计因此把过期号也算进
+            # ready，和 public()["tokenExpired"]、unavailable_reason() 的
+            # 「凭证已过期」自相矛盾。
+            return False
         return self.refresh()
 
     def is_cli_identity(self):

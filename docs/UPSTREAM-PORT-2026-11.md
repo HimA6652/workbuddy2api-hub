@@ -1,7 +1,7 @@
 # 上游批次移植记录（2026-11）
 
 > 范围：本 fork 从 `main@cfaf674`（v1.10.1 发布提交）起，移植上游 `ardeyouxipianyi/workbuddy2api-hub` 在 2026-10-25 至 2026-11-02 之间、本地尚未吸收的修正。
-> 状态：开发分支 `port/upstream-2026-11`；截至功能/测试/文档提交 `7004d84` 共 20 个提交，本文档与 README/CHANGELOG 的同步提交追加在其后；未推送、未合并 `main`、未发布、未部署生产。
+> 状态：目标版本 `v1.11.0`；开发分支 `port/upstream-2026-11` 保留。tag / GitHub Release 与生产部署不在本文范围。
 > 本文只记录可复现的提交映射、验证数字与合并步骤；不包含账号、密钥、本机路径或生产数据。
 
 ## 1. 基线与范围
@@ -92,14 +92,14 @@ git status --short                          -> empty
 - 修复：`_throttle_snapshot()` 只在标记落在当前窗口内时采用；普通 429 主动清掉该模型的 cap mark。
 - 回归：`tests/_test_cap_mark_any_model.py` 7/7 通过，覆盖“旧标记被忽略、当前标记正常显示”。
 
-非阻断观察（本批未改）：
+复查后已处理：
 
-- README 历史区里 `#665` 的说明还有一份重复文案，纯文档问题；
-- `/health` 的总量 `accounts_ready` 仍走 `refresh=True`，本轮没有测到实际性能问题，暂未改。
+- README 历史区里 `#665` 的说明重复文案已删除；
+- `/health` 只在总量 `accounts_ready` 保留一次 `refresh=True`，按区域和当前出口的计数改为 `refresh=False`，避免每个区域各刷新一遍 token。
 
 ## 7. 合并与发布步骤
 
-1. 在开发分支上复核最后一次 `git status --short` 与 `git log --oneline cfaf674..HEAD`，确认移植提交完整（20 个功能/测试/文档提交 + 本次文档同步）、工作树干净。
+1. 在开发分支上复核最后一次 `git status --short` 与 `git log --oneline cfaf674..HEAD`，确认移植与复查提交完整、工作树干净。
 2. 推送分支并开 PR（或按团队约定直接合并）：
 
    ```bash
@@ -113,8 +113,9 @@ git status --short                          -> empty
    git branch -d port/upstream-2026-11
    ```
 
-5. 版本号在合并后按变更范围决定；本批含面板新设置和 `/health` 新字段，至少是 minor，具体版本以发布前评审为准。
+5. 版本号定为 `v1.11.0`：本批含面板新设置和 `/health` 新字段，按 minor 处理。
 6. 生产部署单独做：先比较仓库与生产文件哈希、备份目标文件，再按 `docs/HOT-UPDATE.md` 热切换；本批当前未部署。
+7. `tag` / GitHub Release 不在本次合并范围；发布前按 `docs/FORK-DEV.md` 8.2 在 `main` 上重跑矩阵，再推 `vX.Y.Z` 标签。
 
 ## 8. 回滚
 
@@ -127,4 +128,4 @@ git status --short                          -> empty
 - 每批移植结束就更新本文的提交映射和门禁数字，不把结论只留在会话里。
 - 新上游提交先判断“本地是否已有等价实现”，再决定 cherry-pick、手工适配或跳过；跳过要写原因。
 - 公开文档只写相对路径、占位值和可复现命令，不写账号、密钥、本机绝对路径或生产数据。
-- 截至 2026-11-02 的移植为 20 个功能/测试/文档提交，另加本文档同步提交；以后新增提交时同步更新本页与 README/CHANGELOG 的套件计数。
+- 截至 2026-11-02 的移植为 20 个功能/测试/文档提交，后续复查、版本与文档提交另行追加；以后新增提交时同步更新本页与 README/CHANGELOG 的套件计数。

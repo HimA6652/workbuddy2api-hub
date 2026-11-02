@@ -10472,7 +10472,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.10.1",
+        "version": "1.11.0",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -16153,9 +16153,12 @@ def pool_readiness(pool=None, realm=None):
     for r in realms:
         out["accounts_by_realm"][r] = len(
             [a for a in accounts if (getattr(a, "realm", "") or "") == r])
-        out["accounts_ready_by_realm"][r] = pool.count_ready(realm=r)
+        # Only the whole-pool total keeps refresh=True; a per-realm probe must
+        # not refresh every account once per realm (issue #667 follow-up).
+        out["accounts_ready_by_realm"][r] = pool.count_ready(
+            realm=r, refresh=False)
     out["accounts_ready_current_realm"] = pool.count_ready(
-        realm=realm or CURRENT_REALM)
+        realm=realm or CURRENT_REALM, refresh=False)
     models = set()
     for a in accounts:
         models.update(getattr(a, "free_models", ()) or ())
@@ -19272,7 +19275,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/1.10.1"
+    server_version = "wb-proxy/1.11.0"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -20050,8 +20053,6 @@ class Handler(BaseHTTPRequestHandler):
             # Report the realm actually in use; this used to be the
             # literal "intl" and drifted from the panel switch.
             "realm": CURRENT_REALM,
-            "accounts": len(POOL.accounts) if POOL else 0,
-            "accounts_ready": POOL.count_ready() if POOL else 0,
             "crypto_ok": crypto_ok,
             "model_queues": MODEL_QUEUE_GATE.snapshot(),
         }
