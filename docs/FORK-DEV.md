@@ -3,18 +3,21 @@
 > 这份文档只描述**这个 fork** 的开发流程；上游规范见 [CONTRIBUTING.md](../CONTRIBUTING.md)。
 > 给 AI / 智能体：改本仓库前先读 `../AGENTS.md` 与 `../CONTRIBUTING.md`，冒烟门禁一条都不能跳。
 
-## 1. 远端与分支模型（单 main）
+## 1. 远端与分支模型（main + 临时移植分支）
 
 ```
 origin    git@github.com:<YOU>/workbuddy2api-hub.git       # 自己的 fork，可写
 upstream  https://github.com/ardeyouxipianyi/workbuddy2api-hub.git  # 上游，只读
 main      = 唯一长期分支：上游 main + 我们的提交，日常提交都在这里
+port/upstream-<批次> = 批量吸收上游时的临时分支；合并/放弃后删除
 ```
 
 约定：
 
-1. **只有一条长期分支 `main`**。没有 `dev`、没有 `feat/*`：这个仓库自用，改动不打算回馈上游，
-   多一条分支只多一份同步成本。
+1. **只有一条长期分支 `main`**。没有 `dev`、没有常驻 `feat/*`：这个仓库自用，改动不打算回馈上游，
+   多一条分支只多一份同步成本。批量吸收上游时允许开一条 `port/upstream-<批次>` 临时分支，
+   按批 cherry-pick、逐项过门禁；它不推送、不发布，合并回 `main` 或放弃后即删除。
+   2026-11 的例子见 [`UPSTREAM-PORT-2026-11.md`](UPSTREAM-PORT-2026-11.md)。
 2. **每个提交一件事**（上游 CONTRIBUTING 第 0 节）：能独立评审、独立回滚。
 3. **提交信息**：标题 `<type>(<scope>): 中文摘要`，不带句号、一行只说一件事；
    需要解释时开正文，按「问题 → 做法 → 影响」三段写，中英双语，验证写命令与数字，
@@ -80,12 +83,31 @@ git push origin main
 真要把某个改动回馈上游时，临时开一条一次性分支、`git rebase upstream/main`、单独开 PR，
 合入后删掉——那是一次性动作，不是长期分支。
 
+### 4.1 分批移植上游（2026-11 实践）
+
+当上游改动较多、直接 merge 会把 CodeArts 等大模块一起带进来时，按批 cherry-pick 更可控：
+
+```bash
+git checkout main
+git checkout -b port/upstream-2026-11
+git cherry-pick <upstream-commit>   # 一批一个提交；冲突按“两边都留”解决
+python tests/run_all.py --jobs 4
+python tests/_test_release_engineering.py
+python scripts/check_clean_checkout.py
+```
+
+- 每批结束先跑专项，再跑全量；README 的套件计数必须与测试树一致。
+- 手工适配的提交单独记录（例如本批的 6004 标记复查修复、分析测试假时钟），不要伪装成上游原提交。
+- 分支默认不推送；审查通过后再决定推分支开 PR，还是直接快进/合并 `main`。
+- 提交映射、排除项与门禁数字写在 [`UPSTREAM-PORT-2026-11.md`](UPSTREAM-PORT-2026-11.md)，不要只留在会话里。
+
 ## 5. 目录增量（相对上游）
 
 | 路径 | 内容 |
 |---|---|
 | `panel/` | 本机控制面板（单文件 Python 标准库）：启停/重启网关、LAN 开关、开机自启 |
 | `docs/FORK-DEV.md` | 本文 |
+| `docs/UPSTREAM-PORT-2026-11.md` | 2026-11 上游批次移植的提交映射、排除项、门禁与合并步骤 |
 | `docs/LAN-SHARING.md` | 局域网共享网关操作手册（脱敏） |
 | `docs/PERF-NOTES.md` | 面板卡顿的根因、实测数据、改动清单与上线/回滚步骤 |
 
@@ -94,7 +116,7 @@ git push origin main
 1. **跑测试不要带 `ACCOUNTS_DIR`。** 带着指向真实账号目录的 `ACCOUNTS_DIR` 跑
    `tests/run_all.py`，`_test_agents.py` 的 `opencode models populated from catalog fallback`
    会失败（134 pass / 1 fail）——因为 handler 走了真实账号目录的模型目录，而不是测试里 mock 的
-   `_agents_models()`。`unset ACCOUNTS_DIR` 后单测 135/0、全套 **227 passed / 0 failed**（约 67 s，`--jobs 4`）。
+   `_agents_models()`。`unset ACCOUNTS_DIR` 后单测 135/0、全套 **252 passed / 0 failed**（本次 `--jobs 4` 为 153.5 s；早期记录是 227）。
 2. **8799 在本机不是空闲端口。** 本机 `8799` 被另一个服务（返回 `keypool: 仅支持 GET
    /v1/models...`）占着，wb_proxy 会直接打印 `the port is reserved or held by another program;
    wb-proxy did NOT start.` 然后退出。隔离实例统一用 **8801**。
@@ -199,7 +221,7 @@ WB_UPDATE_REPO=someone/workbuddy2api-hub
 
 ### 8.2 Release 历史与发布流程
 
-当前流程：先推 `main` 并确认同一提交的完整测试矩阵通过，再推 `vX.Y.Z` 标签。Release 工作流校验源码与 OpenWrt 版本，构建附件并创建 **Draft Release**；补齐版本说明并发布后，`release-checksums.yml` 会生成 `checksums.txt`。当前已发布 `v1.10.0`，本次发布目标是 `v1.10.1`。若发布打包在标签后才暴露构建输入错误，修复进 main、复跑矩阵，再把同一个尚未发布 Release 的版本标签移到已验收的修复提交；标签本身不等于已发布版本。
+当前流程：先推 `main` 并确认同一提交的完整测试矩阵通过，再推 `vX.Y.Z` 标签。Release 工作流校验源码与 OpenWrt 版本，构建附件并创建 **Draft Release**；补齐版本说明并发布后，`release-checksums.yml` 会生成 `checksums.txt`。当前已发布 `v1.10.1`（2026-10-29）；上游批次移植仍在 `port/upstream-2026-11` 上，下一版本号待定。若发布打包在标签后才暴露构建输入错误，修复进 main、复跑矩阵，再把同一个尚未发布 Release 的版本标签移到已验收的修复提交；标签本身不等于已发布版本。
 
 以下为 **2026-10-26 首次启用更新检查时**的历史记录（当时还没有任何 Release，现已过时，只用于解释空列表的处理逻辑）：
 
